@@ -58,10 +58,16 @@ PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 # 但通过的是**发布工作流**。那是假阳性：通过得不对。
 CI_WORKFLOW = "validate"
 
-# 注解只统计平台自己那套 CI（Actions）产生的 check run。
-# 同一个提交上还挂着**别的东西**的检查 —— 依赖更新机器人一开 PR 就会挂上一个，
-# 原先不区分来源地统计，会把别人的注解算到本次提交头上，于是报一个假 FAIL。
-ACTIONS_APP_SLUG = "github-actions"
+# 注解只统计**本次提交自己的 CI** 产生的 check run。
+#
+# ⚠️ 不能用「app 是不是 github-actions」来圈定 —— 2026-09-29 实测被推翻：
+# 平台给依赖更新机器人建的 check run 名字叫 `Dependabot`、**app slug 同样是
+# `github-actions`**，上面还挂着一条平台通知（`ubuntu-latest` 迁移公告）。
+# 按 app 过滤会把它算进来，报出一个把别人的话记到自己头上的假 FAIL。
+#
+# 可靠的口径是**归属**：check run 的 `details_url` 里带着它所属的
+# `/actions/runs/<run_id>/job/<job_id>`，拿本次提交的 `CI_WORKFLOW` 那几个 run 的 id 去比。
+# 这条对**任何**往仓库里挂检查的第三方 App 都成立，与它叫什么名字无关。
 
 # 回验计划：**先把每一项登记为「未执行」，跑一项改写一项。**
 # 原先的写法是「执行成功才登记」，于是第 4 项抛异常时第 5–9 项既不执行也不登记 ——
@@ -81,6 +87,27 @@ CHECK_PLAN = (
     ("9b", "latest 落在最高版本（附带判定）"),
     (10, "凭据残留复查"),
 )
+
+CHECK_TITLES = dict((no, name) for no, name in CHECK_PLAN)
+
+
+def _guard(res, item, fn, *a, **kw):
+    """**逐项隔离**：某一项自己抛异常，不许让后面的项一起消失。
+
+    原先只有一个包住整段远端检查的 `try`：第 6 项因为「归档目录名不是本仓库的 tag」
+    抛了 `RuntimeError`，第 7–9b 项就连跑都没跑（报告里全是「未执行」）。
+    而第 9 项恰恰是「Release 资产与 tag 是否一致」—— **真问题最可能就藏在被带崩的那几项里**。
+
+    所以：异常算作**本项的失败**（并且明说「这是回验工具的问题，不代表线上坏了」），
+    其余各项照跑。
+    """
+    try:
+        fn(*a, **kw)
+    except Exception as exc:
+        res.add(item, CHECK_TITLES[item], FAIL,
+                "该项自身抛出异常（%s: %s）—— 这是**回验工具**没能完成检查，"
+                "既不等于线上有问题，也不等于通过；其余各项仍会照跑"
+                % (type(exc).__name__, exc))
 
 
 class Result:
@@ -156,6 +183,33 @@ def remote_refs(url):
 
 
 # ------------------------------------------------------------------ HTTP 层
+
+_CONNECT_HOST = None
+
+
+def force_connect_host(host):
+    """把**所有** DNS 解析都指向 `host` 再连（端口不变，TLS 的 SNI 仍是真实域名）。
+
+    为什么需要它：有些环境把 GitHub 域名写进 `hosts` 指到本机，由一个本地加速器
+    **按 SNI 转发**。这时 `api.github.com` 是通的，但第 9 项要下载的 Release 资产会
+    302 到一个**不在 hosts 里的域名**（`objects.githubusercontent.com` 一类），
+    那个域名解析不出来 ⇒ 第 9 项「资产与 tag 是否一致」直接做不了。
+    实测（2026-09-29，本机加速器开着）：不设它即 `getaddrinfo failed`，
+    设成 `127.0.0.1` 后同样的 URL 取到 157 315 字节、sha256 与平台 digest 一致。
+
+    因为只是把**解析**改掉，真实域名仍进 SNI，证书校验与主机名绑定都不受影响 ——
+    这不是「跳过安全检查」，只是换一个能连通的出口地址。
+    """
+    global _CONNECT_HOST
+    _CONNECT_HOST = host
+    import socket
+    orig = socket.getaddrinfo
+
+    def patched(h, port, *a, **kw):
+        return orig(host, port, *a, **kw)
+
+    socket.getaddrinfo = patched
+
 
 def fetch_json(url, token=None):
     """单点网络出口：测试通过替换本模块的同名属性来桩掉它（离线可跑）。"""
@@ -258,7 +312,18 @@ def check_tag_sets(res, refs, repo):
     return remote_tags
 
 
-def check_history_unchanged(res, refs, baseline_path):
+def check_history_unchanged(res, refs, baseline_path, tag=None):
+    """第 3 项：**只比 tag**。
+
+    原先拿基线里的**全部 ref** 与现在比，于是每次推送都必然报「历史被动过」——
+    因为 `HEAD` 与 `refs/heads/main` 正是被这次推送移动的。若期间还有人
+    **关掉一个机器人开的 PR**，`refs/heads/dependabot/*` 与 `refs/pull/*` 会被一并删除，
+    差异数又凭空多几条。这些变化全都是**预期内**的，与「旧 tag 有没有被重指」无关。
+    实测（2026-09-29，release-pipeline 推 4.0）差异 5 处，**没有一处是 tag**。
+
+    本条要守的是：**已经发布出去的 tag，内容不许被就地改写**。
+    所以口径收窄成 `refs/tags/*`，并**排除本次新推的那个 tag**（它本来就该是新的）。
+    """
     if not baseline_path:
         res.add(3, "旧 tag 的 sha 零变动", SKIP,
                 "未提供推送前基线（用 --write-baseline 先存一份），无法判定")
@@ -268,15 +333,34 @@ def check_history_unchanged(res, refs, baseline_path):
         return
     with open(baseline_path, "r", encoding="utf-8") as fh:
         baseline = json.load(fh)
+
+    base_tags = {k: v for k, v in baseline.items() if k.startswith("refs/tags/")}
+    skipped = len(baseline) - len(base_tags)
+    note = ""
+    if skipped:
+        note = ("；另有 %d 个非 tag 引用（`HEAD` / 分支 / PR）**不计入** —— "
+                "它们本来就会随推送与 PR 的开关而变，与本项无关" % skipped)
+    if tag:
+        mine = "refs/tags/%s" % tag
+        dropped = [k for k in base_tags if k.startswith(mine)]
+        base_tags = {k: v for k, v in base_tags.items() if not k.startswith(mine)}
+        if dropped:
+            note += "；本次新推的 `%s` 已排除" % tag
+    if not base_tags:
+        res.add(3, "旧 tag 的 sha 零变动", SKIP,
+                "基线里除了本次新推的 tag 没有别的 tag，无从判定「旧 tag 是否被改」" + note)
+        return
+
     changed = []
-    for ref, sha in baseline.items():
+    for ref, sha in base_tags.items():
         if refs.get(ref) != sha:
             changed.append("%s: %s -> %s" % (ref, sha, refs.get(ref)))
     if changed:
         res.add(3, "旧 tag 的 sha 零变动", FAIL,
                 "历史被动过：%s" % changed[:5])
     else:
-        res.add(3, "旧 tag 的 sha 零变动", PASS, "基线里 %d 个 ref 全部未变" % len(baseline))
+        res.add(3, "旧 tag 的 sha 零变动", PASS,
+                "基线里 %d 个旧 tag 引用全部未变%s" % (len(base_tags), note))
 
 
 def check_remote_main_tree(res, owner, repo, refs, local, token):
@@ -309,7 +393,69 @@ def check_remote_tag_tree(res, owner, repo, local, tag, token):
         res.add(5, "远端 tag 树 == 本地同名 tag 树", PASS, "%s：%d 个文件逐一致" % (tag, len(local)))
 
 
+def _zip_blobs(path):
+    """zip -> {相对路径: blob sha}（剥掉唯一的顶层目录）。"""
+    with zipfile.ZipFile(path) as zf:
+        names = [n for n in zf.namelist() if not n.endswith("/")]
+        tops = {n.split("/")[0] for n in names}
+        strip = len(tops) == 1 and all("/" in n for n in names)
+        return {n.split("/", 1)[1] if strip else n: blob_sha(zf.read(n)) for n in names}
+
+
+def archive_snapshot_files(snap, remote=None):
+    """归档目录里冻结的「一份内容」有三种常见形态，都要认：
+
+    ① 解出来的快照目录（`history/1.0/<包名>/`）—— 早期归档连 `.git` 一起存的形态；
+    ② 目录本身就是快照（`history/2.0/<若干源码文件>`）；
+    ③ 只放了打包产物（`history/2.0/<包名>.zip`）—— 后期归档的形态。
+
+    ⚠️ **形态按内容判定，不按形状猜，而且要用「完全匹配数」打分选。**
+    两条都是踩出来的：
+
+    ① 只按形状（如「里面只有一个子目录就是它」）会把快照里**普通的子目录**
+       （`docs/`、`scripts/`）当成那一整份内容 —— 比的是别人的一小部分。
+    ② 只看「路径有没有交集」也不够：`history/2.0/` 里同时放着**交付文档**和打包产物，
+       而交付文档里的 `README.md` 与仓库里的 `README.md` **恰好同名** ⇒
+       交集非空，于是选中了交付文档，报出「左独有 4 / 右独有 23」这种看着很严重的差异
+       （实测 2026-09-29）。
+       所以按 **(内容完全相同的文件数, 路径重合数)** 打分取最高 —— 打包产物会以
+       24/24 完胜交付文档的 0/1。
+
+    返回 (文件表, 形态说明)。**形态说明要进报告** —— 否则「比的是什么」无从复核。
+    """
+    inner = [os.path.join(snap, d) for d in sorted(os.listdir(snap))
+             if os.path.isdir(os.path.join(snap, d))]
+    zips = [f for f in sorted(os.listdir(snap)) if f.lower().endswith(".zip")]
+    candidates = [(dir_blobs(snap), "目录内文件")]
+    if len(inner) == 1:
+        candidates.append((dir_blobs(inner[0]),
+                           "解出的快照目录 %s/" % os.path.basename(inner[0])))
+    if len(zips) == 1:
+        candidates.append((_zip_blobs(os.path.join(snap, zips[0])),
+                           "打包产物 %s" % zips[0]))
+    if remote:
+        best = None
+        for files, form in candidates:
+            exact = sum(1 for k, v in files.items() if remote.get(k) == v)
+            overlap = len(set(files) & set(remote))
+            score = (exact, overlap)
+            if best is None or score > best[0]:
+                best = (score, files, form)
+        if best and (best[0][0] or best[0][1]):
+            return best[1], best[2]
+    return candidates[0]
+
+
 def check_archive_snapshots(res, owner, repo, local, archive_root, token):
+    """第 6 项：归档快照 vs 远端同名 tag 树。
+
+    ⚠️ **归档目录名未必是本仓库的 tag。** 本项目 `history/1.0/` 存的是**前身项目**的
+    快照，`1.0` 这个 tag 在**本仓库里根本不存在** ⇒ 原先直接 `git rev-parse 1.0^{commit}`
+    抛异常，把整个远端段（第 6–9b 项）一起带崩，报告里它们全是「未执行」。
+    实测（2026-09-29）：一次回验因此只跑完 4 项就中断，而**真正的线上问题恰恰可能在
+    后面那几项里** —— 例如第 9 项「Release 资产与 tag 是否一致」。
+    所以这里改成：**没有同名 tag 就跳过这一条并写明原因，继续下一条。**
+    """
     if not archive_root:
         res.add(6, "远端每个 tag 树 == 本地归档目录", SKIP, "未提供 --archive-root")
         return
@@ -318,28 +464,35 @@ def check_archive_snapshots(res, owner, repo, local, archive_root, token):
                 "归档目录不存在：%s" % archive_root)
         return
     bad = []
-    checked = 0
+    checked = []
+    skipped = []
     for name in sorted(os.listdir(archive_root)):
         snap = os.path.join(archive_root, name)
         if not os.path.isdir(snap):
             continue
-        ref = run_git(["rev-parse", "%s^{commit}" % name], cwd=local)
-        remote = api_tree(owner, repo, ref.decode().strip(), token)
-        localfiles = dir_blobs(snap)
-        # 归档目录常是嵌套两层：history/<tag>/<name>-<主>-<次>/
-        if len(localfiles) == 0 or not (set(localfiles) & set(remote)):
-            inner = [os.path.join(snap, d) for d in os.listdir(snap)]
-            inner = [d for d in inner if os.path.isdir(d)]
-            if len(inner) == 1:
-                localfiles = dir_blobs(inner[0])
+        try:
+            ref = resolve_tag_commit(local, name)
+        except RuntimeError:
+            skipped.append(name)
+            continue
+        remote = api_tree(owner, repo, ref, token)
+        localfiles, form = archive_snapshot_files(snap, remote)
         only_l, only_r, differ = compare_maps(localfiles, remote)
-        checked += 1
+        checked.append("%s（%s，%d 文件）" % (name, form, len(localfiles)))
         if only_l or only_r or differ:
-            bad.append("%s：%s" % (name, describe(only_l, only_r, differ)))
+            bad.append("%s：%s %s" % (name, form, describe(only_l, only_r, differ)))
+    note = ""
+    if skipped:
+        note = ("；跳过 %d 个（本仓库没有同名 tag，属其它项目的归档）：%s"
+                % (len(skipped), "、".join(skipped)))
     if bad:
-        res.add(6, "远端每个 tag 树 == 本地归档目录", FAIL, str(bad[:5]))
+        res.add(6, "远端每个 tag 树 == 本地归档目录", FAIL, str(bad[:5]) + note)
+    elif not checked:
+        res.add(6, "远端每个 tag 树 == 本地归档目录", SKIP,
+                "归档目录里没有一个能对上本仓库的 tag" + note)
     else:
-        res.add(6, "远端每个 tag 树 == 本地归档目录", PASS, "%d 个归档逐一一致" % checked)
+        res.add(6, "远端每个 tag 树 == 本地归档目录", PASS,
+                "%d 个归档逐一一致：%s" % (len(checked), "、".join(checked)) + note)
 
 
 def check_all_tags_local_vs_remote(res, owner, repo, local, remote_tags, token):
@@ -405,15 +558,41 @@ def check_ci(res, owner, repo, expected_sha, token, workflow=CI_WORKFLOW):
             else:
                 res.add(8, "CI 本次提交的 run", FAIL, detail)
     # 顺带报告本次提交的注解数（判断弃用警告是否已消除）。
-    # **只算 Actions 的 check run** —— 同一个提交上还挂着别的来源的检查，
-    # 一起算就是把别人的注解算到本次头上（见 ACTIONS_APP_SLUG 的说明）。
+    #
+    # ⚠️ **不能用「app 是不是 github-actions」来圈定。** 实测（2026-09-29）
+    # 平台给依赖更新机器人建的 check run 名字就叫 `Dependabot`、**app slug 也是
+    # `github-actions`**，上面挂着一条「`ubuntu-latest` 将迁移到 Ubuntu 26」的平台通知
+    # ⇒ 按 app 过滤照样把它算进来，报出一个假 FAIL。
+    #
+    # 可靠的口径是**归属**：每个 check run 的 `details_url` 形如
+    #   https://github.com/<o>/<r>/actions/runs/<run_id>/job/<job_id>
+    # 用「本次提交的 `%s` 工作流」那几个 run 的 id 去比，才算「本次提交自己的 CI」。
+    # 这条同样适用于任何往仓库里挂检查的第三方 App —— 与它叫什么名字无关。
+    ci_run_ids = {r.get("id") for r in items if _is_workflow(r, workflow)}
     checks = fetch_json("%s/repos/%s/%s/commits/%s/check-runs"
                         % (DEFAULT_API, owner, repo, expected_sha), token)
     cruns = checks.get("check_runs", [])
-    mine = [c for c in cruns if (c.get("app") or {}).get("slug") == ACTIONS_APP_SLUG]
-    others = sorted({(c.get("app") or {}).get("name") or "（来源未知）"
-                     for c in cruns if (c.get("app") or {}).get("slug") != ACTIONS_APP_SLUG})
-    excluded = "；另有非 Actions 的检查未计入：%s" % "、".join(others) if others else ""
+
+    def _belongs(c):
+        du = c.get("details_url") or ""
+        return any(rid and ("/actions/runs/%s/" % rid in du
+                            or du.rstrip("/").endswith("/actions/runs/%s" % rid))
+                   for rid in ci_run_ids)
+
+    mine = [c for c in cruns if _belongs(c)]
+    dropped = [(c.get("name"), (c.get("app") or {}).get("slug"))
+               for c in cruns if not _belongs(c)]
+    excluded = ""
+    if dropped:
+        excluded = ("；另有 %d 个 check run 不属于本次提交的 `%s` 工作流，未计入：%s"
+                    % (len(dropped), workflow,
+                       "、".join("%s[%s]" % (n, s) for n, s in dropped[:6])))
+    if not ci_run_ids:
+        reason = "本次提交名下没有 `%s` 工作流的 run，无从统计" % workflow
+        if dropped:
+            reason += "（该提交上另有 %d 个 check run，但它们不属于本工作流）" % len(dropped)
+        res.add("8b", "本次提交的注解数（只算 Actions，附带判定）", SKIP, reason)
+        return
     counts = [(c.get("name"), (c.get("output") or {}).get("annotations_count")) for c in mine]
     if counts:
         res.add("8b", "本次提交的注解数（只算 Actions，附带判定）",
@@ -421,7 +600,8 @@ def check_ci(res, owner, repo, expected_sha, token, workflow=CI_WORKFLOW):
                 "、".join("%s=%s" % (n, c) for n, c in counts) + excluded)
     else:
         res.add("8b", "本次提交的注解数（只算 Actions，附带判定）", SKIP,
-                "该提交没有 Actions 的 check-run 记录" + excluded)
+                "`%s` 工作流的 run 存在，但没取到它名下的 check run"
+                "（可能尚未上报）—— **这不是通过**" % workflow + excluded)
 
 
 def expected_asset_name(local):
@@ -598,8 +778,15 @@ def main(argv=None):
     ap.add_argument("--asset-name", help="Release 资产名（默认 `<包名>.zip`，包名取本地目录名）")
     ap.add_argument("--ci-workflow", default=CI_WORKFLOW,
                     help="用哪个工作流判定「CI 跑绿了」（默认 %s）" % CI_WORKFLOW)
+    ap.add_argument("--connect-host", metavar="HOST",
+                    help="把所有主机名都解析到 HOST 再连（SNI 与证书校验照旧用真实域名）。"
+                         "用于主机名被 hosts 劫持、由本地加速器按 SNI 转发的环境 —— "
+                         "那种环境下第 9 项的资产下载会因重定向域名解析失败而做不了（见函数说明）")
     ap.add_argument("--offline", action="store_true", help="不发起任何网络请求")
     args = ap.parse_args(argv)
+
+    if args.connect_host:
+        force_connect_host(args.connect_host)
 
     local = os.path.abspath(args.local)
     url = "https://github.com/%s/%s.git" % (args.owner, args.repo)
@@ -630,17 +817,20 @@ def main(argv=None):
         try:
             refs = check_refs(res, local, url, args.tag)
             remote_tags = check_tag_sets(res, refs, local)
-            check_history_unchanged(res, refs, args.baseline)
-            check_remote_main_tree(res, args.owner, args.repo, refs, local, token)
-            check_remote_tag_tree(res, args.owner, args.repo, local, args.tag, token)
-            check_archive_snapshots(res, args.owner, args.repo, local, args.archive_root, token)
-            check_all_tags_local_vs_remote(res, args.owner, args.repo, local, remote_tags, token)
+            # 下面的每一项都各自隔离：见 _guard 的说明。
+            _guard(res, 3, check_history_unchanged, res, refs, args.baseline, args.tag)
+            _guard(res, 4, check_remote_main_tree, res, args.owner, args.repo, refs, local, token)
+            _guard(res, 5, check_remote_tag_tree, res, args.owner, args.repo, local, args.tag, token)
+            _guard(res, 6, check_archive_snapshots, res, args.owner, args.repo, local,
+                   args.archive_root, token)
+            _guard(res, 7, check_all_tags_local_vs_remote, res, args.owner, args.repo, local,
+                   remote_tags, token)
             head = run_git(["rev-parse", "HEAD"], cwd=local).decode().strip()
-            check_ci(res, args.owner, args.repo, head, token, args.ci_workflow)
-            check_latest_release(res, args.owner, args.repo, local, token)
+            _guard(res, 8, check_ci, res, args.owner, args.repo, head, token, args.ci_workflow)
+            _guard(res, "9b", check_latest_release, res, args.owner, args.repo, local, token)
             with tempfile.TemporaryDirectory() as tmp:
-                check_release_asset(res, args.owner, args.repo, local, args.tag, token, tmp,
-                                    args.asset_name)
+                _guard(res, 9, check_release_asset, res, args.owner, args.repo, local,
+                       args.tag, token, tmp, args.asset_name)
         except Exception as exc:          # 明确报告，不静默通过
             res.add("!", "远端检查中断", FAIL,
                     "%s: %s（中断之后的项保持「未执行」—— 既不是通过，也不是失败）"

@@ -11,6 +11,7 @@
 
 import contextlib
 import io
+import json
 import os
 import re
 import shutil
@@ -175,6 +176,57 @@ class TestHistoryUnchanged(Base):
         vp.check_history_unchanged(res, {}, os.path.join(self.tmp, "nope.json"))
         self.assertEqual(len(res.skips), 1)
 
+    def test_non_tag_refs_are_not_history(self):
+        """回归（2026-09-29 实测抓到的第四个假阳性）。
+
+        基线里还记着 `HEAD` / 分支 / PR 引用。推送本身**必然**移动 `HEAD` 与 `main`；
+        关掉一个机器人开的 PR 又会**删掉** `refs/heads/dependabot/*` 与 `refs/pull/*`。
+        原先拿全部 ref 比，于是每次都报「历史被动过」—— 实测差异 5 处，
+        **没有一处是 tag**。本项要守的是「已发布的 tag 不许被就地改写」，所以只比 tag。
+        """
+        path = os.path.join(self.tmp, "baseline.json")
+        write(path, json.dumps({
+            "HEAD": "old-head",
+            "refs/heads/main": "old-main",
+            "refs/heads/dependabot/x": "gone",
+            "refs/pull/1/merge": "gone-too",
+            "refs/tags/3.1": "same",
+        }))
+        now = {"HEAD": "new-head", "refs/heads/main": "new-main",
+               "refs/tags/3.1": "same"}
+        res = vp.Result()
+        vp.check_history_unchanged(res, now, path)
+        self.assertEqual(len(res.fails), 0, res.items)
+        self.assertIn("不计入", res.passes[0]["detail"])
+
+    def test_newly_pushed_tag_is_excluded(self):
+        """本次新推的 tag 本来就该是新的 —— 不排除它，本项必然失败。"""
+        path = os.path.join(self.tmp, "baseline.json")
+        write(path, json.dumps({"refs/tags/3.1": "same", "refs/tags/4.0": "absent-before"}))
+        res = vp.Result()
+        vp.check_history_unchanged(res, {"refs/tags/3.1": "same", "refs/tags/4.0": "brand-new"},
+                                   path, tag="4.0")
+        self.assertEqual(len(res.fails), 0, res.items)
+        self.assertIn("已排除", res.passes[0]["detail"])
+
+    def test_a_real_tag_change_is_still_caught(self):
+        """收窄口径之后，**真正的 tag 被重指**仍然必须被抓到。"""
+        path = os.path.join(self.tmp, "baseline.json")
+        write(path, json.dumps({"refs/tags/3.1": "abc", "refs/tags/3.1^{}": "abc-peeled"}))
+        res = vp.Result()
+        vp.check_history_unchanged(res, {"refs/tags/3.1": "abc", "refs/tags/3.1^{}": "MOVED"}, path)
+        self.assertEqual(len(res.fails), 1)
+        self.assertIn("3.1^{}", res.fails[0]["detail"])
+
+    def test_only_the_new_tag_in_baseline_skips(self):
+        """基线里除新 tag 没有别的 tag（仓库第一次发布）⇒ 跳过，不假装通过。"""
+        path = os.path.join(self.tmp, "baseline.json")
+        write(path, json.dumps({"refs/tags/1.0": "x"}))
+        res = vp.Result()
+        vp.check_history_unchanged(res, {"refs/tags/1.0": "x"}, path, tag="1.0")
+        self.assertEqual(len(res.skips), 1)
+        self.assertEqual(len(res.passes), 0)
+
 
 class TestTagSets(Base):
     def test_symmetric_difference_empty(self):
@@ -240,16 +292,29 @@ class TestTagSetsPeel(Base):
 
 
 class TestCheckCi(Base):
+    HEAD_RUN = 200
+    OLD_RUN = 100
+
     def _fake(self, conclusion, head, annotations=0, extra_checkruns=()):
+        """check run 要用 `details_url` 表明它**归属于哪个 run**。
+
+        第 8b 项按归属取数，不再按 app 名字 —— 因为平台给依赖更新机器人建的 check run
+        **app slug 也是 `github-actions`**（2026-09-29 实测），按名字过滤会把它算进来。
+        """
+        head_run = self.HEAD_RUN
+
         def fake(url, token=None):
             if "/actions/runs" in url:
                 return {"workflow_runs": [
-                    {"name": "validate", "run_number": 1, "conclusion": "success",
-                     "head_sha": "old", "created_at": "2026-01-01T00:00:00Z"},
-                    {"name": "validate", "run_number": 2, "conclusion": conclusion,
-                     "head_sha": head, "created_at": "2026-01-02T00:00:00Z"},
+                    {"id": self.OLD_RUN, "name": "validate", "run_number": 1,
+                     "conclusion": "success", "head_sha": "old",
+                     "created_at": "2026-01-01T00:00:00Z"},
+                    {"id": head_run, "name": "validate", "run_number": 2,
+                     "conclusion": conclusion, "head_sha": head,
+                     "created_at": "2026-01-02T00:00:00Z"},
                 ]}
-            runs = [{"name": "validate", "app": {"slug": vp.ACTIONS_APP_SLUG},
+            runs = [{"name": "validate", "app": {"slug": "github-actions"},
+                     "details_url": "https://github.com/o/r/actions/runs/%d/job/7" % head_run,
                      "output": {"annotations_count": annotations}}]
             runs.extend(extra_checkruns)
             return {"check_runs": runs}
@@ -281,13 +346,14 @@ class TestCheckCi(Base):
         def fake(url, token=None):
             if "/actions/runs" in url:
                 return {"workflow_runs": [
-                    {"name": "validate", "run_number": 7, "conclusion": "success",
+                    {"id": 1, "name": "validate", "run_number": 7, "conclusion": "success",
                      "head_sha": "abc", "created_at": "2026-01-01T00:00:00Z"},
-                    {"name": "validate", "run_number": 8, "conclusion": "failure",
+                    {"id": 2, "name": "validate", "run_number": 8, "conclusion": "failure",
                      "head_sha": "someone-elses-sha",
                      "created_at": "2026-01-09T00:00:00Z"},
                 ]}
-            return {"check_runs": [{"name": "validate", "app": {"slug": vp.ACTIONS_APP_SLUG},
+            return {"check_runs": [{"name": "validate", "app": {"slug": "github-actions"},
+                                    "details_url": "https://github.com/o/r/actions/runs/1/job/7",
                                     "output": {"annotations_count": 0}}]}
         vp.fetch_json = fake
         res = vp.Result()
@@ -300,7 +366,7 @@ class TestCheckCi(Base):
         def fake(url, token=None):
             if "/actions/runs" in url:
                 return {"workflow_runs": [
-                    {"name": "validate", "run_number": 8, "conclusion": "success",
+                    {"id": 8, "name": "validate", "run_number": 8, "conclusion": "success",
                      "head_sha": "someone-elses-sha",
                      "created_at": "2026-01-09T00:00:00Z"},
                 ]}
@@ -316,7 +382,7 @@ class TestCheckCi(Base):
         def fake(url, token=None):
             if "/actions/runs" in url:
                 return {"workflow_runs": [
-                    {"name": "release", "run_number": 1, "conclusion": "success",
+                    {"id": 1, "name": "release", "run_number": 1, "conclusion": "success",
                      "head_sha": "abc", "created_at": "2026-01-02T00:00:00Z"},
                 ]}
             return {"check_runs": []}
@@ -343,6 +409,7 @@ class TestCheckCi(Base):
     def test_checkrun_from_another_app_is_excluded(self):
         """回归：原先不区分来源地统计注解，把依赖更新机器人的检查算到了本次头上。"""
         extra = [{"name": "Dependabot", "app": {"slug": "dependabot", "name": "Dependabot"},
+                  "details_url": "https://dependabot-api.githubapp.com",
                   "output": {"annotations_count": 3}}]
         vp.fetch_json = self._fake("success", "abc", annotations=0, extra_checkruns=extra)
         res = vp.Result()
@@ -351,6 +418,41 @@ class TestCheckCi(Base):
         detail = [i for i in res.items if i["no"] == "8b"][0]["detail"]
         self.assertIn("validate=0", detail)
         self.assertIn("未计入", detail)
+
+    def test_platform_checkrun_under_the_actions_app_is_excluded(self):
+        """回归（2026-09-29 实测抓到的第五个假阳性）。
+
+        平台给依赖更新机器人建的 check run **app slug 就是 `github-actions`**，
+        名字叫 `Dependabot`，还挂着一条平台通知。按 app 过滤拦不住它 ——
+        必须按**归属**（`details_url` 里的 run id）判，它属于**另一个工作流的 run**。
+        """
+        extra = [{"name": "Dependabot", "app": {"slug": "github-actions"},
+                  "details_url": "https://github.com/o/r/actions/runs/999/job/1",
+                  "output": {"annotations_count": 1}}]
+        vp.fetch_json = self._fake("success", "abc", annotations=0, extra_checkruns=extra)
+        res = vp.Result()
+        vp.check_ci(res, "o", "r", "abc", None)
+        self.assertEqual(len(res.fails), 0, res.items)
+        detail = [i for i in res.items if i["no"] == "8b"][0]["detail"]
+        self.assertIn("validate=0", detail)
+        self.assertIn("Dependabot[github-actions]", detail)
+
+    def test_no_checkrun_of_the_ci_workflow_is_not_a_pass(self):
+        """run 在、但它名下的 check run 取不到 ⇒ SKIP，且措辞不得像通过。"""
+        def fake(url, token=None):
+            if "/actions/runs" in url:
+                return {"workflow_runs": [
+                    {"id": 200, "name": "validate", "run_number": 2,
+                     "conclusion": "success", "head_sha": "abc",
+                     "created_at": "2026-01-02T00:00:00Z"},
+                ]}
+            return {"check_runs": []}
+        vp.fetch_json = fake
+        res = vp.Result()
+        vp.check_ci(res, "o", "r", "abc", None)
+        item = [i for i in res.items if i["no"] == "8b"][0]
+        self.assertEqual(item["status"], vp.SKIP)
+        self.assertIn("这不是通过", item["detail"])
 
 
 class TestCheckReleaseAsset(Base):
@@ -525,6 +627,157 @@ class TestInterruptionSemantics(Base):
                          sorted(map(str, self.ALL_NUMBERS)))
         self.assertEqual(len(numbers), len(set(map(str, numbers))),
                          "回验计划里有重复号位 —— 同号位会被覆盖，等于有一项查不到")
+
+
+class TestPerItemIsolation(Base):
+    """回归（2026-09-29 实测）：某一项自己抛异常，不许把**后面的项**一起带崩。
+
+    那一次的实况：第 6 项因「归档目录名不是仓库的 tag」抛 `RuntimeError`，
+    第 7–9b 项连跑都没跑（报告里全是「未执行」）—— 而第 9 项恰恰是
+    「Release 资产与 tag 是否一致」，**真问题最可能就藏在这些被带崩的项里**。
+    """
+
+    def test_guard_turns_exception_into_that_items_failure_only(self):
+        res = vp.Result()
+        vp._guard(res, 3, lambda *a: (_ for _ in ()).throw(RuntimeError("模拟异常")))
+        self.assertEqual([i["no"] for i in res.fails], [3])
+        self.assertIn("回验工具", res.fails[0]["detail"])
+        # 关键：它只登记了**自己那一项**，没有波及别的项
+        self.assertEqual(len(res.items), 1)
+
+    def test_guard_marks_the_item_so_it_never_looks_like_a_pass(self):
+        res = vp.Result()
+        vp._guard(res, 9, lambda *a: 1 / 0)
+        self.assertEqual(res.fails[0]["status"], vp.FAIL)
+        self.assertEqual(len(res.passes), 0)
+
+    def test_guard_keeps_the_plan_title(self):
+        res = vp.Result()
+        vp._guard(res, 6, lambda *a: (_ for _ in ()).throw(ValueError("x")))
+        self.assertEqual(res.fails[0]["name"], dict(vp.CHECK_PLAN)[6])
+
+
+class TestArchiveSnapshots(Base):
+    """第 6 项：归档形态有三种，且**归档目录名未必是本仓库的 tag**。"""
+
+    def _snapshot(self, name, files):
+        d = os.path.join(self.tmp, "history", name)
+        for rel, text in files.items():
+            write(os.path.join(d, rel), text)
+        return d
+
+    def test_directory_without_matching_tag_is_skipped_not_failed(self):
+        """回归（2026-09-29 实测）：`history/1.0/` 是**前身项目**的快照，
+        `1.0` 这个 tag 在本仓库里根本没有 ⇒ 原先直接抛异常、带崩整段。"""
+        repo = make_repo(self.tmp, tag="2.0")
+        self._snapshot("1.0", {"SKILL.md": "前身项目"})
+        self._snapshot("2.0", SAMPLE)
+        calls = []
+
+        def fake_tree(owner, repo_, sha, token=None):
+            calls.append(sha)
+            return {rel: vp.blob_sha(text.encode()) for rel, text in SAMPLE.items()}
+
+        self.addCleanup(setattr, vp, "api_tree", vp.api_tree)
+        self.addCleanup(setattr, vp, "resolve_tag_commit", vp.resolve_tag_commit)
+        vp.api_tree = fake_tree
+        res = vp.Result()
+        vp.check_archive_snapshots(res, "o", "r", repo, os.path.join(self.tmp, "history"), None)
+        self.assertEqual(len(res.fails), 0, res.items)
+        self.assertEqual(len(res.passes), 1, res.items)
+        detail = res.passes[0]["detail"]
+        self.assertIn("1.0", detail)          # 跳过了它，并且写明
+        self.assertIn("跳过", detail)
+        self.assertEqual(len(calls), 1, "不该为没有 tag 的归档去取远端树")
+
+    def test_mismatch_is_still_a_failure(self):
+        """跳过逻辑不能把**真不一致**也放过去。"""
+        repo = make_repo(self.tmp, tag="2.0")
+        self._snapshot("2.0", {"SKILL.md": "内容被改过"})
+        self.addCleanup(setattr, vp, "api_tree", vp.api_tree)
+        vp.api_tree = lambda o, r, s, t=None: {rel: vp.blob_sha(x.encode())
+                                               for rel, x in SAMPLE.items()}
+        res = vp.Result()
+        vp.check_archive_snapshots(res, "o", "r", repo, os.path.join(self.tmp, "history"), None)
+        self.assertEqual(len(res.fails), 1, res.items)
+
+    def test_zip_form_of_archive_is_recognised(self):
+        """归档常是「只放一个 zip」的形态，也要能比。"""
+        repo = make_repo(self.tmp, tag="2.0")
+        d = os.path.join(self.tmp, "history", "2.0")
+        os.makedirs(d)
+        with open(os.path.join(d, "pkg-2.0.zip"), "wb") as fh:
+            fh.write(build_zip("pkg", SAMPLE))
+        self.addCleanup(setattr, vp, "api_tree", vp.api_tree)
+        vp.api_tree = lambda o, r, s, t=None: {rel: vp.blob_sha(x.encode())
+                                               for rel, x in SAMPLE.items()}
+        res = vp.Result()
+        vp.check_archive_snapshots(res, "o", "r", repo, os.path.join(self.tmp, "history"), None)
+        self.assertEqual(len(res.passes), 1, res.items)
+        self.assertIn("打包产物", res.passes[0]["detail"])
+
+    def test_archive_root_without_any_matching_tag_skips(self):
+        repo = make_repo(self.tmp, tag="9.9")
+        self._snapshot("1.0", {"a": "1"})
+        res = vp.Result()
+        vp.check_archive_snapshots(res, "o", "r", repo, os.path.join(self.tmp, "history"), None)
+        self.assertEqual(len(res.skips), 1, res.items)
+        self.assertEqual(len(res.passes), 0)
+
+    def test_zip_wins_over_delivery_docs_with_a_colliding_name(self):
+        """回归（2026-09-29 实测）。
+
+        归档目录里**同时**放着交付文档与打包产物，而交付文档里的 `README.md` 与
+        仓库里的 `README.md` **恰好同名** ⇒ 只看「路径有没有交集」会选中交付文档，
+        报出「左独有 4 / 右独有 23」这种看着很严重的差异。
+        必须按 (内容完全相同的文件数, 路径重合数) 打分 —— 打包产物 24/24 完胜 0/1。
+        """
+        repo = make_repo(self.tmp, tag="2.0")
+        d = os.path.join(self.tmp, "history", "2.0")
+        write(os.path.join(d, "README.md"), "这是交付夹的导航，不是仓库里的那个\n")
+        write(os.path.join(d, "CHANGES-2.0.md"), "变更说明\n")
+        with open(os.path.join(d, "pkg-2.0.zip"), "wb") as fh:
+            fh.write(build_zip("pkg", SAMPLE))
+        remote = {rel: vp.blob_sha(x.encode()) for rel, x in SAMPLE.items()}
+        self.addCleanup(setattr, vp, "api_tree", vp.api_tree)
+        vp.api_tree = lambda o, r, s, t=None: remote
+        res = vp.Result()
+        vp.check_archive_snapshots(res, "o", "r", repo, os.path.join(self.tmp, "history"), None)
+        self.assertEqual(len(res.fails), 0, res.items)
+        self.assertIn("打包产物", res.passes[0]["detail"])
+
+
+class TestConnectHost(Base):
+    """`--connect-host`：把解析钉到本机，SNI 与证书校验仍用真实域名。
+
+    实况（2026-09-29）：加速器把 github 域名指到本机、按 SNI 转发，
+    `api.github.com` 通，但 Release 资产会 302 到**不在 hosts 里**的域名，
+    那个域名解析不出来 ⇒ 第 9 项直接做不了。
+    """
+
+    def test_patching_only_redirects_resolution(self):
+        import socket
+        original = socket.getaddrinfo
+        try:
+            vp.force_connect_host("127.0.0.1")
+            self.assertEqual(vp._CONNECT_HOST, "127.0.0.1")
+            infos = socket.getaddrinfo("objects.githubusercontent.com", 443)
+            self.assertTrue(all(i[4][0] == "127.0.0.1" for i in infos), infos)
+        finally:
+            socket.getaddrinfo = original
+            vp._CONNECT_HOST = None
+
+    def test_flag_is_off_by_default(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
+            vp.main(["--help"])
+        self.assertIn("--connect-host", buf.getvalue())
+
+    def test_help_says_it_keeps_sni_and_cert_checks(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
+            vp.main(["--help"])
+        self.assertIn("SNI", buf.getvalue())
 
 
 class TestOfflineCli(Base):

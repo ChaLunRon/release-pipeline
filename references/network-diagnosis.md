@@ -170,6 +170,34 @@ git config --global http.sslCAInfo "<合并后的 ca-bundle>"
   所以**别用 `curl` 判断 git 的证书配置是否生效**；
   **以 `git ls-remote` 为准：它返回 `fatal: could not read Username` 就说明 TLS 已通过、只差凭据。**
 
+#### ⚠️ 这类环境的一个死角：**没被劫持的域名解析不出来**（2026-09-29 实测）
+
+加速器只改写**它列在 hosts 里的那几个域名**。于是：
+
+| 请求 | 结果 |
+|---|---|
+| `api.github.com`（已被劫持） | 通 |
+| 下载 Release 资产 → 302 到 `objects.githubusercontent.com` / `release-assets.githubusercontent.com`（**不在 hosts 里**） | `getaddrinfo failed`（或超时） |
+
+**症状很好认**：API 读取全都正常，只有「下载文件」这一步挂掉；
+而报错是**名称解析**失败，不是 TLS 失败 —— 别去查证书。
+
+**解法（通用，不写死任何具体地址）**：把**解析**钉到一个能连通该加速器的地址，
+TLS 的 SNI 与证书校验**照旧用真实域名**：
+
+```python
+import socket
+_orig = socket.getaddrinfo
+socket.getaddrinfo = lambda h, p, *a, **k: _orig("<加速器监听地址>", p, *a, **k)
+```
+
+因为只换了解析目标、主机名仍进 SNI，**证书校验与主机名绑定都还在** ——
+这不是「跳过安全检查」，而是换一个出口地址。`scripts/verify_publish.py` 把它做成了
+`--connect-host <地址>`（默认不开，需要时才用）。
+
+> 通用判据：**「同一个域名下有的请求通、有的不通」先看解析，而不是先看 TLS。**
+> 再补一条同族的：**「报错里出现的是名称解析 / DNS 字样」就与证书无关。**
+
 ### D. 三类都不行
 
 换一条通道，并**如实说明代价**：
