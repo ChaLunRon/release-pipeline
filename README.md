@@ -1,6 +1,6 @@
 # release-pipeline
 
-![version](https://img.shields.io/badge/version-3.0-blue)
+![version](https://img.shields.io/badge/version-3.1-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![python](https://img.shields.io/badge/python-3.8%2B-blue)
 [![validate](https://github.com/ChaLunRon/release-pipeline/actions/workflows/validate.yml/badge.svg)](https://github.com/ChaLunRon/release-pipeline/actions/workflows/validate.yml)
@@ -45,7 +45,7 @@ python scripts/selfcheck.py . --quiet
 
 # 3) 推送之后：九项回验
 python scripts/verify_publish.py --owner <owner> --repo <repo> \
-    --local . --tag 3.0 --baseline tags.json
+    --local . --tag 3.1 --baseline tags.json
 ```
 
 两个脚本都是**纯标准库**，无需安装任何第三方依赖。
@@ -93,27 +93,34 @@ release-pipeline/
 │   ├── network-diagnosis.md          网络通路分层诊断
 │   ├── token-and-credentials.md      令牌权限、凭据最小化、两条执行路径
 │   ├── ci-and-release.md             CI 与自动发布（含两个工作流模板）
-│   ├── verification.md               九项回验的可执行口径
+│   ├── verification.md               九项回验的可执行口径（含三项附带判定）
 │   ├── maintenance-burden.md         发布之后的长期负担（一次性 / 持续 × 机器 / 人类）
+│   ├── channel-boundaries.md         两个分发渠道各自的规则与边界（消歧用）
 │   └── portable-writing.md           可移植写法（剔除环境专属值）
 ├── scripts/
 │   ├── selfcheck.py                  结构规范 + 可移植性自检
-│   └── verify_publish.py             推送后九项回验
-├── tests/                            离线单元测试
+│   └── verify_publish.py             推送后九项回验（+ 三项附带判定）
+├── tests/                            离线单元测试（含工作流检查器的用例）
 └── .github/
     ├── workflows/validate.yml        校验（只读权限）
     ├── workflows/release.yml         发布（写权限）
-    └── check_zip.py                  发布物与 tag 的逐文件一致性自检
+    ├── check_zip.py                  发布物与 tag 的逐文件一致性自检
+    ├── lint_workflows.py             工作流的引用形态与权限检查
+    ├── dependabot.yml                依赖与 Action 更新（分组）
+    └── SECURITY.md                   安全策略与私密漏洞上报
 ```
 
 ## 自检与测试
 
 ```bash
 python scripts/selfcheck.py .          # 结构规范 + 可移植性
+python .github/lint_workflows.py       # 工作流的引用形态与权限
 python -m unittest discover -s tests -v
 ```
 
 - 自检器与单测都是**离线可跑**的：测试用桩替换网络出口，断网或挂代理后结果不变。
+- `lint_workflows.py` 是**把清单里「机器可查」的项真正跑起来**的那一步：
+  它抓「Action 用了可变标签而不是完整 SHA」「工作流顶层权限没收敛」这类问题。
 - 自检器里有一组「检查器自身不得含有被检查字面量」的用例 —— 防的是「一次全局替换
   把检查规则改坏，而它仍然打印通过」这种静默失效。
 - 声称支持的 Python 版本由 CI 矩阵兑现（见 [`.github/workflows/validate.yml`](.github/workflows/validate.yml)）。
@@ -144,6 +151,7 @@ zip 的条目时间戳取构建机器所在时区的时间。所以流水线里�
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| `3.1` | 2026-09-29 | 把 3.0 评审暴露的问题逐条落地：**裁决两处跨技能的数字冲突**（描述字段上限 / 版本号形态），新增 [`references/channel-boundaries.md`](references/channel-boundaries.md) 说明「两个分发渠道各有各的规则，不是同一问题的两种解法」；**修复回验脚本的六个实现缺陷**（异常时后续项会从报告里消失、资产不按文件名匹配、凭据扫描截断后仍报通过等）；工作流的 Action 固定到完整 SHA，并补上真正会跑的一致性检查（`.github/lint_workflows.py`）；维护清单加「**本仓库现状**」列，让未达标可见 |
 | `3.0` | 2026-09-29 | 新增**阶段 11 长期维护**与配套细则：把「枯燥但必须做」的事按「一次性 / 持续成本 × 机器判定 / 人类判断」分类，并给出各类的现成工具；新增 2026 年的「贡献洪水」与「自动化自己造噪声」两个现实问题；铁律增至十二条 |
 | `2.0` | 2026-09-29 | 更名并扩为端到端：并入快照号位取证与仓库重建（原另一技能的内核）、新增首次发布一篇、新增「不可变发布」与两条执行路径、补入 stat cache 与复制语义两个陷阱 |
 | `1.0` | 2026-09-28 | 首个版本（名 `github-upload-pipeline`）：九阶段流水线与九项回验，三条可移植性规则做成机器判据 |

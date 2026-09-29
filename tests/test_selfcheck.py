@@ -141,6 +141,76 @@ class TestVersionConsistency(Base):
         self.assertIn("版本一致", out)
 
 
+class TestVersionChannel(Base):
+    """版本号形态**由分发渠道决定**。（见 references/channel-boundaries.md）
+
+    两个渠道各有自己的规矩，不是「同一个问题的两种解法」：
+    本地 / GitHub 通道用两段式 `主.次`；平台上传通道用三段式 SemVer。
+    拿一个渠道的规则去判另一个渠道的包，会得到一个**假 FAIL**。
+    """
+
+    @staticmethod
+    def make_platform_package(tmp, version="1.0.0", name="demo-skill"):
+        root = os.path.join(tmp, name)
+        os.makedirs(root)
+        write(os.path.join(root, "SKILL.md"),
+              "---\nname: %s\nversion: \"%s\"\ndisplay_name: 演示\ndisplay_name_en: Demo\n"
+              "description_zh: 中文描述。\ndescription_en: |\n  English description.\n"
+              "description: 演示技能。\n---\n\n正文。\n" % (name, version))
+        write(os.path.join(root, "README.md"),
+              "![v](https://img.shields.io/badge/version-%s-blue)\n" % version)
+        write(os.path.join(root, "CHANGELOG.md"), "## %s\n\n初始版本。\n" % version)
+        return root
+
+    def test_platform_package_with_semver_passes(self):
+        root = self.make_platform_package(self.tmp)
+        code, out = run(root)
+        self.assertEqual(code, 0, out)
+        self.assertIn("渠道 platform", out)
+
+    def test_semver_platform_package_is_not_rejected(self):
+        """回归：原先只认 `主.次`，会把平台形态的 `1.0.0` 判成 FAIL —— 假 FAIL。"""
+        root = self.make_platform_package(self.tmp)
+        _code, out = run(root)
+        self.assertNotIn("应为", out)
+
+    def test_local_package_with_semver_fails(self):
+        root = make_package(self.tmp, version="1.0.0")
+        code, out = run(root)
+        self.assertEqual(code, 1)
+        self.assertIn("主.次（本地 / GitHub 通道）", out)
+
+    def test_channel_can_be_forced(self):
+        root = self.make_platform_package(self.tmp)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            code = selfcheck.main([root, "--channel", "local"])
+        self.assertEqual(code, 1)
+
+    def test_block_scalar_description_is_measured(self):
+        """描述写成块标量（`description: |`）时也要量出真实长度 ——
+        否则一段一千多字的描述会被读成两个字符，「超限」被静默放过。"""
+        root = os.path.join(self.tmp, "demo-skill")
+        os.makedirs(root)
+        long_desc = "触发词 " * 400
+        write(os.path.join(root, "SKILL.md"),
+              "---\nname: demo-skill\ndescription: |\n  %s\n---\n\n正文。\n" % long_desc)
+        expected = len(" ".join(long_desc.split()))
+        code, out = run(root)
+        self.assertEqual(code, 1)
+        self.assertIn("长度 %d > 1000" % expected, out)
+
+    def test_description_over_limit_is_a_failure(self):
+        """上限是 1000，不是 1024 —— 依据是平台自己的报错原文。"""
+        root = os.path.join(self.tmp, "demo-skill")
+        os.makedirs(root)
+        write(os.path.join(root, "SKILL.md"),
+              "---\nname: demo-skill\ndescription: %s\n---\n\n正文。\n" % ("字" * 1010))
+        code, out = run(root)
+        self.assertEqual(code, 1)
+        self.assertIn("长度 1010 > 1000", out)
+
+
 class TestLinksAndReferences(Base):
     def test_broken_relative_link(self):
         root = make_package(self.tmp, extras={

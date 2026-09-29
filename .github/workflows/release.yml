@@ -27,8 +27,9 @@ on:
         required: false
         default: ""
 
-permissions:
-  contents: write
+# 顶层默认不给任何权限，权限在 job 级显式授予（见 validate.yml 的同一处说明）。
+
+permissions: {}
 
 concurrency:
   group: release
@@ -38,14 +39,22 @@ jobs:
   release:
     name: 建 Release 并附 zip
     runs-on: ubuntu-22.04
+    # 建 Release 与上传资产需要写权限 —— 只有这一个 job 需要。
+    permissions:
+      contents: write
     env:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
-      # 钉 v5 而不是最新的 v7：v5 是**第一个**以 Node 24 为默认的大版本，已足够消除
+      # 固定到完整 SHA（`v5` 于 2026-09-29 指向的提交），不用可变标签：
+      # 标签可以被上游改指到别处，等于把执行权交出去。行尾注释保留大版本号便于人读；
+      # 升级交给依赖更新机器人（见 .github/dependabot.yml）。
+      #
+      # 为什么选 v5 而不是最新的 v7：v5 是**第一个**以 Node 24 为默认的大版本，已足够消除
       # 运行时弃用警告；而 v6 把凭据从 `.git/config` 改存到单独文件，本工作流下面要执行
       # `git fetch origin main`，依赖的正是检出动作持久化的凭据 —— 在无法本地复现 CI 的
-      # 前提下，不值得为「更新」冒这个行为变化。
-      - uses: actions/checkout@v5
+      # 前提下，不值得为「更新」冒这个行为变化。这与「固定到 SHA」不矛盾：
+      # 一个决定**选哪个版本**，一个决定**用什么形态引用**。
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
         with:
           # 回填要能枚举全部 tag；同时要能读到主分支上的 CHANGELOG
           fetch-depth: 0

@@ -263,10 +263,12 @@ class TestCheckCi(Base):
 
 
 class TestCheckReleaseAsset(Base):
-    def _run(self, zip_bytes):
+    def _run(self, zip_bytes, assets=None, extra=None):
         repo = make_repo(self.tmp, tag="1.0")
-        vp.fetch_json = lambda url, token=None: {
-            "assets": [{"browser_download_url": "https://downloads.invalid/a.zip"}]}
+        rel = {"assets": assets if assets is not None else [
+            {"name": "repo.zip", "browser_download_url": "https://downloads.invalid/a.zip"}]}
+        rel.update(extra or {})
+        vp.fetch_json = lambda url, token=None: rel
         vp.fetch_bytes = lambda url, token=None: zip_bytes
         res = vp.Result()
         vp.check_release_asset(res, "o", "r", repo, "1.0", None, self.tmp)
@@ -292,12 +294,70 @@ class TestCheckReleaseAsset(Base):
         self.assertIn("顶层目录不唯一", res.fails[0]["detail"])
 
     def test_no_assets_fails(self):
-        repo = make_repo(self.tmp, tag="1.0")
-        vp.fetch_json = lambda url, token=None: {"assets": []}
-        res = vp.Result()
-        vp.check_release_asset(res, "o", "r", repo, "1.0", None, self.tmp)
+        res = self._run(b"", assets=[])
         self.assertEqual(len(res.fails), 1)
         self.assertIn("没有资产", res.fails[0]["detail"])
+
+    def test_asset_chosen_by_name_not_by_position(self):
+        """回归：原先取 `assets[0]`。一个 Release 常同时挂 zip + 校验和 + 签名 + SBOM，
+        取第一个等于在赌列表顺序。"""
+        good = build_zip("demo", SAMPLE)
+        assets = [
+            {"name": "checksums.txt", "browser_download_url": "https://downloads.invalid/c.txt"},
+            {"name": "repo.zip", "browser_download_url": "https://downloads.invalid/a.zip"},
+        ]
+        repo = make_repo(self.tmp, tag="1.0")
+        vp.fetch_json = lambda url, token=None: {"assets": assets}
+        vp.fetch_bytes = lambda url, token=None: (
+            b"not a zip" if url.endswith("c.txt") else good)
+        res = vp.Result()
+        vp.check_release_asset(res, "o", "r", repo, "1.0", None, self.tmp)
+        self.assertEqual(len(res.fails), 0, res.items)
+        self.assertIn("repo.zip", res.passes[0]["detail"])
+
+    def test_expected_asset_missing_fails(self):
+        assets = [{"name": "something-else.zip",
+                   "browser_download_url": "https://downloads.invalid/x.zip"}]
+        res = self._run(b"", assets=assets)
+        self.assertEqual(len(res.fails), 1)
+        self.assertIn("没有名为", res.fails[0]["detail"])
+
+    def test_draft_release_fails(self):
+        res = self._run(build_zip("demo", SAMPLE), extra={"draft": True})
+        self.assertEqual(len(res.fails), 1)
+        self.assertIn("draft", res.fails[0]["detail"])
+
+    def test_prerelease_fails(self):
+        res = self._run(build_zip("demo", SAMPLE), extra={"prerelease": True})
+        self.assertEqual(len(res.fails), 1)
+        self.assertIn("prerelease", res.fails[0]["detail"])
+
+
+class TestLatestRelease(Base):
+    def _run(self, latest_tag, tags=("1.0", "2.0")):
+        repo = make_repo(self.tmp, tag=tags[0])
+        for extra_tag in tags[1:]:
+            git(repo, "tag", extra_tag)
+        vp.fetch_json = lambda url, token=None: {"tag_name": latest_tag}
+        res = vp.Result()
+        vp.check_latest_release(res, "o", "r", repo, None)
+        return res
+
+    def test_latest_on_highest_version_passes(self):
+        res = self._run("2.0")
+        self.assertEqual(len(res.fails), 0, res.items)
+
+    def test_latest_on_older_version_fails(self):
+        res = self._run("1.0")
+        self.assertEqual(len(res.fails), 1)
+        self.assertIn("本地最高版本是 2.0", res.fails[0]["detail"])
+
+    def test_no_version_tag_skips(self):
+        repo = make_repo(self.tmp, tag=None)
+        res = vp.Result()
+        vp.check_latest_release(res, "o", "r", repo, None)
+        self.assertEqual(len(res.passes), 0)
+        self.assertEqual(len(res.skips), 1)
 
 
 class TestCredentialResidue(Base):
@@ -315,6 +375,65 @@ class TestCredentialResidue(Base):
         vp.check_credentials(res, repo)
         self.assertEqual(len(res.fails), 1)
         self.assertIn("令牌字面量", res.fails[0]["detail"])
+
+    def test_token_beyond_former_two_mib_window_is_detected(self):
+        """回归：原先只读每个文件的前 2 MiB 却报 PASS —— 典型的软失败
+        （截断扫描的结果被当成了完整结论）。对象库里的 packfile 很容易超过 2 MiB，
+        所以这条必须有回归用例守住。"""
+        repo = make_repo(self.tmp)
+        write(os.path.join(repo, ".git", "objects", "pack-fake.pack"),
+              "x" * (3 * 1024 * 1024) + "\n" + FAKE_TOKEN + "\n")
+        res = vp.Result()
+        vp.check_credentials(res, repo)
+        self.assertEqual(len(res.fails), 1)
+        self.assertIn("令牌字面量", res.fails[0]["detail"])
+
+    def test_pass_message_only_claims_what_was_read(self):
+        """结论必须说清是「逐文件读全」的还是「只读了一部分」的。"""
+        repo = make_repo(self.tmp)
+        res = vp.Result()
+        vp.check_credentials(res, repo)
+        self.assertIn("逐文件读全", res.passes[0]["detail"])
+
+
+class TestInterruptionSemantics(Base):
+    """回归：原先「执行成功才登记」，于是第 4 项抛异常时第 5–9 项**从报告里消失** ——
+    报告既不显示它们失败，也不显示它们被跳过。这直接违反了本技能自己的纪律
+    「跳过必须显式打印，并在汇总里单独计数」。"""
+
+    PLAN_NUMBERS = (1, 2, 3, 4, 5, 6, 7, 8, "8b", 9, "9b")
+    ALL_NUMBERS = PLAN_NUMBERS + (10,)
+
+    def test_exception_leaves_every_item_accounted_for(self):
+        repo = make_repo(self.tmp, tag="1.0")
+
+        def boom(url):
+            raise RuntimeError("模拟限流 / 403")
+
+        self.addCleanup(setattr, vp, "remote_refs", vp.remote_refs)
+        vp.remote_refs = boom
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = vp.main(["--owner", "o", "--repo", "r",
+                            "--local", repo, "--tag", "1.0"])
+        out = buf.getvalue()
+        self.assertEqual(code, 1, out)
+        # 远端项必须全部以「跳过」现身，而不是从报告里消失
+        for no in self.PLAN_NUMBERS:
+            self.assertIn("[SKIP] %s " % no, out,
+                          "第 %s 项从报告里消失了：\n%s" % (no, out))
+        # 凭据复查在本机就能跑，它应当照常出结论（通过或跳过都行，但不能消失）
+        self.assertRegex(out, r"\[(PASS|FAIL|SKIP)\] 10 ")
+        self.assertIn("远端检查中断", out)
+        # 汇总必须体现「有 11 项没跑」，而不是让人从「1 通过」里猜
+        self.assertIn("11 跳过", out)
+
+    def test_plan_covers_every_numbered_item_once(self):
+        numbers = [no for no, _ in vp.CHECK_PLAN]
+        self.assertEqual(sorted(map(str, numbers)),
+                         sorted(map(str, self.ALL_NUMBERS)))
+        self.assertEqual(len(numbers), len(set(map(str, numbers))),
+                         "回验计划里有重复号位 —— 同号位会被覆盖，等于有一项查不到")
 
 
 class TestOfflineCli(Base):

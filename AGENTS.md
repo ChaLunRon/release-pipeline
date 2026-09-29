@@ -12,10 +12,12 @@
 
 ```bash
 python scripts/selfcheck.py . --quiet
+python .github/lint_workflows.py
 python -m unittest discover -s tests
 ```
 
-改之前跑一遍确认基线是绿的；改之后跑一遍确认没有新问题。两条都离线可跑。
+改之前跑一遍确认基线是绿的；改之后跑一遍确认没有新问题。三条都离线可跑。
+第三条专管工作流：`uses:` 引用是否固定到**完整 SHA**、权限是否在顶层收敛。
 
 ## 必须守住的四条
 

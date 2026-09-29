@@ -1,0 +1,42 @@
+# 依赖更新机器人配置。
+#
+# 为什么需要它：工作流里的 Action 被**固定到完整 SHA**（见 workflows/ 里的注释）。
+# 固定之后，安全的前提是「有人负责升 SHA」—— 否则固定的那一刻起，这个仓库就在悄悄变旧。
+# 机器人就是那个「有人」。
+#
+# 为什么只开 `github-actions` 这一个生态：本仓库是纯标准库的 Python 项目，
+# 没有任何第三方运行时依赖。**不要为了「配置齐全」而开一个没有内容的生态** ——
+# 那只会让配置文件看起来更完整、实际多出一条永远不会触发的路径。
+#
+# 关键设置是 `groups`。没有它，N 个 Action 会开出 N 个 PR，评审队列被淹没；
+# **队列一积压，自动更新就等于没开**。
+#
+# ⚠️ 安全更新**不分组**：本配置只分组常规更新（下面这一组）。
+# 平台的安全告警走独立通道、单独排队、单独可见 ——
+# 把安全修复混进一个「一堆小升级」的 PR 里，等于把它藏起来。
+
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    # 只采用发布已超过 7 天的版本：上游刚发版就踩坑的代价，
+    # 比晚一周拿到新版本高得多。
+    cooldown:
+      default-days: 7
+    commit-message:
+      # 前缀带上生态，方便在提交列表里一眼分辨
+      prefix: "ci"
+    groups:
+      # 把全部 Action 的小版本 / 补丁升级合进一个 PR。
+      # 大版本升级**不**合进来 —— 大版本会带入行为变化（例如检出动作的
+      # 凭据持久化方式），需要单独评审。
+      actions-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    labels:
+      - dependencies

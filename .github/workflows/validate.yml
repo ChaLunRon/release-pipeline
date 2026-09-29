@@ -9,11 +9,11 @@ on:
   pull_request:
   workflow_dispatch:
 
-# 本工作流只读：建 Release 需要写权限，单独放在 release.yml 里，
-# 这样例行检查不会带着多余的写权限。
+# 顶层**默认不给任何权限**（`{}`），权限一律在 job 级显式授予。
+# 这样将来新增一个 job 却忘了写权限时，它拿到的是「没有权限」，
+# 而不是「上一个 job 恰好需要的那些权限」—— 漏写权限时，默认值落在安全的那一侧。
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: validate-${{ github.ref }}
@@ -22,6 +22,10 @@ concurrency:
 jobs:
   validate:
     name: 规范自检 + 单元测试 (py${{ matrix.python-version }})
+    # 本工作流只读：建 Release 需要写权限，单独放在 release.yml 里，
+    # 这样例行检查不会带着多余的写权限。
+    permissions:
+      contents: read
     # 不要用 `-latest`：runner 镜像会升级，而旧版本解释器的构建产物在新镜像上
     # 可能取不到，矩阵会随机挂掉。钉一个明确的镜像标签，让失败可复现。
     runs-on: ubuntu-22.04
@@ -38,17 +42,16 @@ jobs:
         # 3.9 与 3.13 分别代表中段与较新的稳定版。
         python-version: ["3.8", "3.9", "3.13"]
     steps:
-      # actions/* 的大版本决定它跑在哪个 Node 运行时上。checkout 的 v5 与
-      # setup-python 的 v6 是各自**第一个**以 Node 24 为默认的大版本；停在旧大版本
-      # 会让每次运行都带一条 deprecation 警告（Node 20 于 2026-04 EOL，runner 自
-      # 2026-06-02 起默认 Node 24、2026-09-16 起移除 Node 20 二进制），之后会变成失败。
+      # ---- Action 的引用形态：固定到完整 SHA，不用可变标签 ----
+      # 标签（`@v5`）是**可变的**：上游可以把它改指到任何提交，等于把本仓库的执行权
+      # 交给他。所以这里固定到「该大版本**当时**指向的完整提交」，行尾注释写回大版本号
+      # 便于人读。SHA 取自 2026-09-29 读一次标签接口的结果。
       #
-      # 这里取「**能消除该警告的最小大版本**」，而不是最新版：
-      # checkout 的 v6 改了凭据持久化方式（Persist creds to a separate file）、
-      # v7 又限制了对 fork PR 的检出；setup-python 的 v7 移除了 `pip-install` 输入。
-      # 本工作流只用 `path` 与 `python-version` 这类最基础的输入，
-      # 大版本跳跃只会带入与本次无关的行为变化。下次这两个大版本被弃用时按同样规则再升一档。
-      - uses: actions/checkout@v5
+      # ⚠️ 这与下面「取能消除警告的最小大版本、不追最新」**不矛盾**，两者是两个维度：
+      # 那条说的是**选哪个版本**（升一档、不跳档）；这条说的是**用什么形态引用**
+      # （不可变 SHA 而不是可变标签）。同时满足的做法就是钉在这一档大版本对应的 SHA 上，
+      # 升级交给依赖更新机器人（见 .github/dependabot.yml，生态设为 github-actions）。
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
         with:
           # 先落到中性目录，下面读出 frontmatter 的 `name` 后再改名。
           path: _checkout
@@ -77,7 +80,15 @@ jobs:
           echo "skill_dir=$name" >> "$GITHUB_OUTPUT"
           echo "技能目录：$name"
 
-      - uses: actions/setup-python@v6
+      # 大版本的选择理由（钉在哪个 SHA 上）：checkout 的 v5 与 setup-python 的 v6 是
+      # 各自**第一个**以 Node 24 为默认的大版本；停在旧大版本会让每次运行都带一条
+      # deprecation 警告（Node 20 于 2026-04 EOL、runner 自 2026-06-02 起默认 Node 24、
+      # 2026-09-16 起移除 Node 20 二进制），之后会变成失败。取「**能消除该警告的最小
+      # 大版本**」而不是最新版：checkout 的 v6 改了凭据持久化方式、v7 又限制了对 fork PR
+      # 的检出；setup-python 的 v7 移除了 `pip-install` 输入。本工作流只用 `path` 与
+      # `python-version` 这类最基础的输入，大版本跳跃只会带入与本次无关的行为变化。
+      # 下次这两个大版本被弃用时按同样规则再升一档（并由机器人跟着升 SHA）。
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
         with:
           python-version: ${{ matrix.python-version }}
 

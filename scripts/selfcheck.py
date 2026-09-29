@@ -17,14 +17,20 @@
   1. SKILL.md 存在且含合法的 YAML frontmatter
   2. `name`：仅小写字母/数字/连字符、不以连字符开头结尾、无连续连字符、
      <=64 字符、不含保留字、**与所在目录名一致**
-  3. `description`：存在、<=1024 字符、不含 XML 标签、不用第一人称开头
+  3. 描述字段：`description` 必须存在；平台上传形态下还会一并检查
+     `description_zh` / `description_en`。三者各自 <= 1000 字符；
+     `description` 另需不含 XML 标签、不用第一人称开头
   4. SKILL.md 正文（不含 frontmatter）行数 < 500
   5. references/ 下超过 100 行的文件必须带 `## 目录`
   6. references/ 之间**不得互相引用**（引用只能有一层深度）
   7. 全部相对 Markdown 链接可达；行内锚点按 GitHub 算法可解析
   8. 所有文本文件行尾为 LF（无 CRLF）
   9. scripts/ 下每个 .py 都能编译
- 10. 版本一致性：`metadata.version` == CHANGELOG 最新小节号 == README 徽章版本串
+ 10. 版本一致性：版本号 == CHANGELOG 最新小节号 == README 徽章版本串。
+     版本号的**形态由分发渠道决定**（见 references/channel-boundaries.md）：
+     本地 / GitHub 通道用两段式 `主.次`（写在 `metadata.version`）；
+     平台上传通道用平台要求的三段式 SemVer（写在顶层 `version`）。
+     按表头形态**自动分流**，也可用 `--channel` 强制指定
  11. 工作区没有 `__pycache__` / `*.pyc` 残留（打包前必须清干净）
 
 可移植性（本工具的**核心增量**，对应「换一台机器使用」这个真实需求）：
@@ -63,7 +69,12 @@ import sys
 # 官方规范里点名保留的标识（`skill` 不在其中 —— 以 skill- 开头的技能名是合法的）。
 RESERVED_WORDS = ("claude", "anthropic", "agent-skills")
 MAX_NAME_LEN = 64
-MAX_DESC_LEN = 1024
+# 描述字段上限取 1000，不是常见的 1024。
+# 依据是平台自己的报错原文：「Skill 英文描述：当前 1630 字符，上限 1000 字符」。
+# 1024 只是「看起来像」—— 那是内存与协议里的习惯值，在这里没有任何来源。
+# 预检工具宁严勿松：放宽只会让超限的包在自检里「通过」、然后被平台拒绝，
+# 而那正是这个技能最想避免的一类失败。宁严的代价不过是偶尔多问一句。
+MAX_DESC_LEN = 1000
 MAX_SKILL_BODY_LINES = 500
 TOC_MIN_LINES = 100
 
@@ -136,8 +147,23 @@ def rel(root, path):
     return os.path.relpath(path, root).replace(BACKSLASH, "/")
 
 
+# frontmatter 里可能出现的块标量指示符（`description: |` 这类多行写法）。
+# 描述字段在**平台上传形态**下常写成块标量；不认它，一段一千多字的描述会被读成
+# 两个字符，于是「超限」被静默放过 —— 恰好是长度检查最不该出的错。
+BLOCK_SCALAR_INDICATORS = ("|", ">", "|-", ">-", "|+", ">+")
+
+
 def parse_frontmatter(text):
-    """极简 frontmatter 解析：顶层键 + 一层缩进子键。"""
+    """极简 frontmatter 解析：顶层键 + 一层缩进。
+
+    缩进行的含义**按内容分辨**：
+
+    * 整段都形如 `子键: 值` ⇒ 嵌套映射（如 `metadata:` 下挂 `version:`）；
+    * 其余 ⇒ 文本（块标量正文，或没有指示符的续行），折叠成一行。
+
+    第二种情况必须支持：长度检查依赖它。显式写了 `|` / `>-` 时**一律按文本**处理，
+    不再尝试当映射 —— 否则正文里恰好出现 `foo: bar` 形状的行会被误读成子键。
+    """
     if not text.startswith("---"):
         return None, text
     parts = text.split("\n---", 1)
@@ -145,25 +171,46 @@ def parse_frontmatter(text):
         return None, text
     raw = parts[0][3:]
     body = parts[1].lstrip("\n")
+
     data = {}
-    current = None
+    pending = []          # [(键 或 None, [缩进行], 是否显式块标量)]
+
+    def flush():
+        if not pending:
+            return
+        key, lines, explicit_text = pending.pop()
+        if key is None:
+            return
+        if not explicit_text:
+            pairs = []
+            for ln in lines:
+                m = re.match(r"^\s+([A-Za-z0-9_-]+)\s*:\s*(.*)$", ln)
+                if not m:
+                    pairs = None
+                    break
+                pairs.append((m.group(1), m.group(2).strip().strip("'\"")))
+            if pairs:
+                data[key] = dict(pairs)
+                return
+        data[key] = " ".join(ln.strip() for ln in lines).strip()
+
     for line in raw.splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         if line[:1] not in (" ", "\t"):
+            flush()
             m = re.match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", line)
-            if m:
-                key, val = m.group(1), m.group(2).strip()
-                if val == "":
-                    data[key] = {}
-                    current = key
-                else:
-                    data[key] = val.strip("'\"")
-                    current = None
-        elif current is not None:
-            m = re.match(r"^\s+([A-Za-z0-9_-]+)\s*:\s*(.*)$", line)
-            if m and isinstance(data.get(current), dict):
-                data[current][m.group(1)] = m.group(2).strip().strip("'\"")
+            if not m:
+                continue
+            key, val = m.group(1), m.group(2).strip()
+            if val and val not in BLOCK_SCALAR_INDICATORS:
+                data[key] = val.strip("'\"")
+                pending.append((None, [], False))
+            else:
+                pending.append((key, [], bool(val)))
+        elif pending:
+            pending[-1][1].append(line)
+    flush()
     return data, body
 
 
@@ -240,19 +287,31 @@ def check_name(rep, fm, root):
     return name
 
 
+def _check_desc_length(rep, key, value):
+    """按平台口径计长：折叠连续空白后数字符。"""
+    n = len(" ".join(value.split()))
+    if n > MAX_DESC_LEN:
+        rep.fail("`%s` 长度 %d > %d（描述字段是平台触发的唯一依据，也是超限高发处）"
+                 % (key, n, MAX_DESC_LEN))
+    else:
+        rep.ok("`%s` 长度 %d / %d" % (key, n, MAX_DESC_LEN))
+
+
 def check_description(rep, fm):
     desc = fm.get("description")
     if not desc:
         rep.fail("frontmatter 缺少 `description` 字段")
-        return
-    if len(desc) > MAX_DESC_LEN:
-        rep.fail("`description` 长度 %d > %d" % (len(desc), MAX_DESC_LEN))
     else:
-        rep.ok("`description` 长度 %d / %d" % (len(desc), MAX_DESC_LEN))
-    if re.search(r"<[A-Za-z/]", desc):
-        rep.fail("`description` 含 XML/HTML 标签")
-    if re.match(r"^(我|我们|you|I)\b", desc.strip()):
-        rep.warn("`description` 建议用第三人称（当前以第一/第二人称开头）")
+        _check_desc_length(rep, "description", desc)
+        if re.search(r"<[A-Za-z/]", desc):
+            rep.fail("`description` 含 XML/HTML 标签")
+        if re.match(r"^(我|我们|you|I)\b", desc.strip()):
+            rep.warn("`description` 建议用第三人称（当前以第一/第二人称开头）")
+    # 平台上传形态另有两个描述字段，且是超限高发区 —— 有就一并量。
+    for key in ("description_zh", "description_en"):
+        value = fm.get(key)
+        if isinstance(value, str) and value.strip():
+            _check_desc_length(rep, key, value)
 
 
 def check_skill_body(rep, body):
@@ -360,36 +419,94 @@ def check_scripts(rep, root):
     rep.ok("scripts/ 下 %d 个脚本编译通过" % count)
 
 
-def check_version_consistency(rep, root, fm):
-    meta = fm.get("metadata")
-    if not isinstance(meta, dict) or "version" not in meta:
-        rep.warn("frontmatter 里读不到 `metadata.version`，跳过版本一致性检查")
-        return
-    version = meta["version"]
-    if not re.fullmatch(r"\d+\.\d+", version):
-        rep.fail("`metadata.version` 应为 `主.次` 形态：%r" % version)
+# 版本号形态由**分发渠道**决定，两个渠道的权威规则不同
+# （见 references/channel-boundaries.md）：
+#   * 本地 / GitHub 通道：本技能自己的两段式 `主.次`，写在 `metadata.version`；
+#   * 平台上传通道：平台要求的三段式 SemVer，写在顶层 `version`，
+#     且与七字段表头（`display_name` / `description_zh` / `description_en`）同时出现。
+#
+# 这两套规则**不是「同一个问题的两种解法」**，而是两个注册表各自的规矩 ——
+# 所以按表头形态**自动分流**，而不是挑一个当标准。拿一个渠道的规则去判另一个渠道
+# 的包，只会得到一个假 FAIL。
+SEMVER_RE = r"\d+\.\d+\.\d+"
+LOCAL_VERSION_RE = r"\d+\.\d+"
+PLATFORM_HEADER_KEYS = ("display_name", "description_zh", "description_en")
+
+CHANNELS = {
+    "local": (LOCAL_VERSION_RE, "主.次（本地 / GitHub 通道）"),
+    "platform": (SEMVER_RE, "主.次.修订（平台上传通道）"),
+}
+
+
+def detect_channel(fm):
+    """按表头形态判断这是给哪个渠道的包。
+
+    判据：顶层有 `version` **且**带平台专有表头键 ⇒ 平台上传形态；
+    否则按本地 / GitHub 形态处理（本技能自己的包就是这一种）。
+    """
+    top_version = fm.get("version")
+    if isinstance(top_version, str) and top_version \
+            and any(k in fm for k in PLATFORM_HEADER_KEYS):
+        return "platform"
+    return "local"
+
+
+def check_version_consistency(rep, root, fm, channel="auto"):
+    mode = detect_channel(fm) if channel == "auto" else channel
+    ver_re, human = CHANNELS[mode]
+
+    # 渠道被**显式指定**（`--channel local|platform`）却找不到该渠道的版本号字段，
+    # 说明这个包根本不属于这个渠道 —— 那是 FAIL，不是「跳过」。
+    # 自动识别时只警告：一个还没写版本号的草稿不该被判不合格。
+    forced = channel != "auto"
+
+    if mode == "platform":
+        version = fm.get("version")
+        if not isinstance(version, str) or not version:
+            if forced:
+                rep.fail("显式指定了渠道 `platform`，但表头里读不到顶层 `version`")
+            else:
+                rep.warn("表头里读不到顶层 `version`，跳过版本一致性检查")
+            return
+    else:
+        meta = fm.get("metadata")
+        if not isinstance(meta, dict) or "version" not in meta:
+            if forced:
+                rep.fail("显式指定了渠道 `local`，但表头里读不到 `metadata.version`")
+            else:
+                rep.warn("frontmatter 里读不到 `metadata.version`，跳过版本一致性检查")
+            return
+        version = meta["version"]
+
+    if not re.fullmatch(ver_re, version):
+        rep.fail("`version` 应为 %s 形态，实际是 %r。\n"
+                 "        判定的渠道是 `%s`；形态不合预期时，先确认分发的到底是哪个渠道"
+                 "（可用 --channel 强制指定）。" % (human, version, mode))
         return
 
     changelog = os.path.join(root, "CHANGELOG.md")
     if not os.path.isfile(changelog):
         rep.warn("没有 CHANGELOG.md，无法核对版本号")
     else:
-        heads = re.findall(r"^##\s+(\d+\.\d+)\s*$", read_text(changelog), re.M)
+        heads = re.findall(r"^##\s+(" + ver_re + r")\s*$", read_text(changelog), re.M)
         if not heads:
-            rep.fail("CHANGELOG.md 里找不到 `## 主.次` 形态的小节标题")
+            rep.fail("CHANGELOG.md 里找不到 `## %s` 形态的小节标题" % human.split("（")[0])
         elif heads[0] != version:
-            rep.fail("CHANGELOG.md 最新小节是 `## %s`，与 `metadata.version`（%s）不一致"
+            rep.fail("CHANGELOG.md 最新小节是 `## %s`，与 `version`（%s）不一致"
                      % (heads[0], version))
         else:
-            rep.ok("版本一致：CHANGELOG 最新小节 == metadata.version == %s" % version)
+            rep.ok("版本一致：CHANGELOG 最新小节 == version == %s（渠道 %s）"
+                   % (version, mode))
 
     readme = os.path.join(root, "README.md")
     if os.path.isfile(readme):
-        badges = set(re.findall(r"version-(\d+\.\d+)", read_text(readme)))
+        # 负向断言 `(?![.\d])` 防止把 `version-1.0` 从 `version-1.0.0` 里截出来。
+        badges = set(re.findall(r"version-(" + ver_re + r")(?![.\d])",
+                                read_text(readme)))
         if not badges:
-            rep.warn("README.md 里没有 `version-主.次` 徽章，无法核对")
+            rep.warn("README.md 里没有 `version-%s` 徽章，无法核对" % human.split("（")[0])
         elif badges - {version}:
-            rep.fail("README.md 徽章版本 %s 与 `metadata.version`（%s）不一致"
+            rep.fail("README.md 徽章版本 %s 与 `version`（%s）不一致"
                      % (sorted(badges), version))
         else:
             rep.ok("版本一致：README 徽章 == %s" % version)
@@ -506,6 +623,9 @@ def main(argv=None):
                                  description="技能包结构与可移植性自检（纯标准库）")
     ap.add_argument("root", nargs="?", default=".", help="技能仓库根目录（含 SKILL.md）")
     ap.add_argument("--quiet", action="store_true", help="只输出失败与警告")
+    ap.add_argument("--channel", choices=("auto", "local", "platform"), default="auto",
+                    help="版本号形态按哪个分发渠道判定（默认按表头形态自动识别，"
+                         "见 references/channel-boundaries.md）")
     args = ap.parse_args(argv)
 
     root = os.path.abspath(args.root)
@@ -518,7 +638,7 @@ def main(argv=None):
     if fm:
         check_name(rep, fm, root)
         check_description(rep, fm)
-        check_version_consistency(rep, root, fm)
+        check_version_consistency(rep, root, fm, args.channel)
     check_skill_body(rep, body)
     check_references(rep, root)
     check_links(rep, root)
