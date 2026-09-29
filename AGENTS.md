@@ -4,7 +4,7 @@
 
 ## 这个仓库是什么
 
-一个 Agent Skill：`SKILL.md` 是主文件（十一阶段流水线与铁律），`references/` 放细则，
+一个 Agent Skill：`SKILL.md` 是主文件（十二阶段流水线与十二条铁律），`references/` 放细则，
 `scripts/` 放可执行的检查工具。**它不是普通的 Python 项目** ——
 技能能被正确安装、能被人读懂，与代码能跑同样重要。
 

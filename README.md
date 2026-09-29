@@ -1,15 +1,16 @@
 # release-pipeline
 
-![version](https://img.shields.io/badge/version-2.0-blue)
+![version](https://img.shields.io/badge/version-3.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![python](https://img.shields.io/badge/python-3.8%2B-blue)
 [![validate](https://github.com/ChaLunRon/release-pipeline/actions/workflows/validate.yml/badge.svg)](https://github.com/ChaLunRon/release-pipeline/actions/workflows/validate.yml)
 
-把本地的东西**整理成正确的版本、发布到 GitHub、再逐项证明「线上与本地一致」**的端到端流水线。
+把本地的东西**整理成正确的版本、发布到 GitHub、逐项证明「线上与本地一致」**，
+并让它在**发布之后长期不腐坏**的端到端流水线。
 
-它不是「`git push` 一下就完事」，而是十一个阶段：形态判断 → 快照号位取证（可选）→
+它不是「`git push` 一下就完事」，而是十二个阶段：形态判断 → 快照号位取证（可选）→
 可发布性自检 → 网络通路 → 令牌权限 → 凭据最小化 → 精确推送 → CI →
-历史 Release 回填 → 九项回验 → 留档。
+历史 Release 回填 → 九项回验 → 留档 → **长期维护**。
 
 ## 它接得住两种输入
 
@@ -44,7 +45,7 @@ python scripts/selfcheck.py . --quiet
 
 # 3) 推送之后：九项回验
 python scripts/verify_publish.py --owner <owner> --repo <repo> \
-    --local . --tag 2.0 --baseline tags.json
+    --local . --tag 3.0 --baseline tags.json
 ```
 
 两个脚本都是**纯标准库**，无需安装任何第三方依赖。
@@ -62,6 +63,11 @@ python scripts/verify_publish.py --owner <owner> --repo <repo> \
 | 归档比对报「全部文件都不一致」 | 在不含 `.git` 的目录里跑 `ls-tree` 会取到空集；改用手算 Git 对象指纹 |
 | 改过文件却「没有改动」可提交 | 体积与修改时间都相同 ⇒ 命中 stat cache；删 `.git/index` 强制重哈希 |
 | 一堆快照号位对不上内容 | 三路取证（文件集合 / 特征串 / 相似度）判真实版本，号位按内容定 |
+| 依赖更新 PR 堆积成山、没人处理 | 没配**分组**：一个包开一个 PR。分组是这里最重要的设置，且安全更新要**不**分组 |
+| 陈旧的 issue / PR 无人清理 | 交给定期跑的清理机制，配好豁免标签与每小时上限（平台的滥用防护会限流） |
+| 「读起来专业但经不起推敲」的贡献越来越多 | 提交成本趋零、评审成本不变 ⇒ 先写贡献政策（披露 + 人类负责），再卡「**所有**外部贡献者需批准」 |
+| 发布凭据是长期令牌，怕泄露 | 换成 OIDC 信任发布：仓库里不再留任何长期发布令牌（主流注册表 2025 年底已全部支持） |
+| 自己的机器人好像在制造低质 issue | 自动回复把噪声**放大**了 ⇒ 先停掉，复核它生成的内容质量，再决定要不要重开 |
 
 ## 三条可移植性规则（本仓库的自我约束）
 
@@ -80,7 +86,7 @@ python scripts/verify_publish.py --owner <owner> --repo <repo> \
 
 ```
 release-pipeline/
-├── SKILL.md                          技能主文件（十一阶段流水线 + 铁律 + 检查清单）
+├── SKILL.md                          技能主文件（十二阶段流水线 + 十二条铁律 + 检查清单）
 ├── references/                       按主题展开的细则
 │   ├── audit-and-rebuild.md          快照号位取证与仓库重建
 │   ├── first-publish.md              首次发布：默认分支 / 建仓 / 门面 / 身份
@@ -88,6 +94,7 @@ release-pipeline/
 │   ├── token-and-credentials.md      令牌权限、凭据最小化、两条执行路径
 │   ├── ci-and-release.md             CI 与自动发布（含两个工作流模板）
 │   ├── verification.md               九项回验的可执行口径
+│   ├── maintenance-burden.md         发布之后的长期负担（一次性 / 持续 × 机器 / 人类）
 │   └── portable-writing.md           可移植写法（剔除环境专属值）
 ├── scripts/
 │   ├── selfcheck.py                  结构规范 + 可移植性自检
@@ -137,6 +144,7 @@ zip 的条目时间戳取构建机器所在时区的时间。所以流水线里�
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| `3.0` | 2026-09-29 | 新增**阶段 11 长期维护**与配套细则：把「枯燥但必须做」的事按「一次性 / 持续成本 × 机器判定 / 人类判断」分类，并给出各类的现成工具；新增 2026 年的「贡献洪水」与「自动化自己造噪声」两个现实问题；铁律增至十二条 |
 | `2.0` | 2026-09-29 | 更名并扩为端到端：并入快照号位取证与仓库重建（原另一技能的内核）、新增首次发布一篇、新增「不可变发布」与两条执行路径、补入 stat cache 与复制语义两个陷阱 |
 | `1.0` | 2026-09-28 | 首个版本（名 `github-upload-pipeline`）：九阶段流水线与九项回验，三条可移植性规则做成机器判据 |
 
