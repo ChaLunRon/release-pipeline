@@ -1,0 +1,101 @@
+name: validate
+
+# 本工作流只做**机器能判定**的检查：结构规范、脚本可编译、单元测试。
+# 内容层面的纪律（判据是否准确、措辞是否可移植）无法自动化，见 CONTRIBUTING.md。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 本工作流只读：建 Release 需要写权限，单独放在 release.yml 里，
+# 这样例行检查不会带着多余的写权限。
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: 规范自检 + 单元测试 (py${{ matrix.python-version }})
+    # 不要用 `-latest`：runner 镜像会升级，而旧版本解释器的构建产物在新镜像上
+    # 可能取不到，矩阵会随机挂掉。钉一个明确的镜像标签，让失败可复现。
+    runs-on: ubuntu-22.04
+    # 关键：禁止写 .pyc。自检器有一条「工作区不得有 __pycache__」的规则，
+    # 而 unittest 导入模块时会顺手生成缓存 —— 不关掉的话，自检器自身的
+    # 存在就会让后面的步骤破坏前面的结论。同时这也让「打包前先清缓存」成为常态。
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        # 这里必须包含**文档里声称支持的最低版本**。README 与 SKILL.md 都声明
+        # 支持 Python 3.8+，所以 CI 真去跑 3.8 —— 否则那句声明只是没人验证过的断言。
+        # 3.9 与 3.13 分别代表中段与较新的稳定版。
+        python-version: ["3.8", "3.9", "3.13"]
+    steps:
+      # actions/* 的大版本决定它跑在哪个 Node 运行时上。checkout 的 v5 与
+      # setup-python 的 v6 是各自**第一个**以 Node 24 为默认的大版本；停在旧大版本
+      # 会让每次运行都带一条 deprecation 警告（Node 20 于 2026-04 EOL，runner 自
+      # 2026-06-02 起默认 Node 24、2026-09-16 起移除 Node 20 二进制），之后会变成失败。
+      #
+      # 这里取「**能消除该警告的最小大版本**」，而不是最新版：
+      # checkout 的 v6 改了凭据持久化方式（Persist creds to a separate file）、
+      # v7 又限制了对 fork PR 的检出；setup-python 的 v7 移除了 `pip-install` 输入。
+      # 本工作流只用 `path` 与 `python-version` 这类最基础的输入，
+      # 大版本跳跃只会带入与本次无关的行为变化。下次这两个大版本被弃用时按同样规则再升一档。
+      - uses: actions/checkout@v5
+        with:
+          # 先落到中性目录，下面读出 frontmatter 的 `name` 后再改名。
+          path: _checkout
+
+      # 规范要求 frontmatter 的 `name` 与「所在目录名」完全一致，而检出目录由
+      # **仓库名**决定 —— 一旦仓库改名（或放进合集仓库），直接跑校验就会报
+      # 「name 与目录名不一致」。那是环境差异，不是内容问题。
+      # 所以这里不依赖仓库名：先搬进以 `name` 命名的目录，后续步骤一律在那里执行。
+      # 直接 `git clone` 的人也可能遇到同一处不一致，见 README 的安装说明。
+      - name: 按 SKILL.md 的 name 建立同名目录
+        id: layout
+        run: |
+          set -eu
+          name="$(python - <<'PY'
+          import pathlib
+          import re
+
+          front = pathlib.Path("_checkout/SKILL.md").read_text(encoding="utf-8").split("---", 2)[1]
+          match = re.search(r"^name:[ \t]*([a-z0-9-]+)[ \t]*$", front, re.M)
+          if not match:
+              raise SystemExit("SKILL.md 的 frontmatter 里读不到 name")
+          print(match.group(1))
+          PY
+          )"
+          mv _checkout "$name"
+          echo "skill_dir=$name" >> "$GITHUB_OUTPUT"
+          echo "技能目录：$name"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 显示环境
+        working-directory: ${{ steps.layout.outputs.skill_dir }}
+        run: python -VV
+
+      # 顺序有讲究：自检器要先跑。它包含「工作区不得有 Python 缓存」这条规则，
+      # 而下面的 compileall 与 unittest 都会生成缓存（已用 PYTHONDONTWRITEBYTECODE 兜底，
+      # 但依赖顺序仍然更稳）。
+      - name: 技能结构规范 + 可移植性自检
+        working-directory: ${{ steps.layout.outputs.skill_dir }}
+        run: python scripts/selfcheck.py . --quiet
+
+      - name: 脚本语法检查
+        working-directory: ${{ steps.layout.outputs.skill_dir }}
+        run: python -m compileall -q scripts
+
+      - name: 单元测试
+        working-directory: ${{ steps.layout.outputs.skill_dir }}
+        run: python -m unittest discover -s tests -v

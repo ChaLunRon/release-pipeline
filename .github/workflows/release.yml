@@ -1,0 +1,156 @@
+name: release
+
+# 推 tag 时自动建 Release，并把「解压即可用」的 zip 作为资产上传。
+#
+# 为什么单开一个工作流：本工作流需要 `contents: write`，而 validate.yml 只需要读权限。
+# 分开就能把写权限限制在真正需要的那一条路径上，不放大例行检查的权限。
+#
+# zip 不是手工打的，而是用 `git archive` 从 tag 现算 —— 这样发布物**可由 tag 重现**：
+# 任何人执行 `git archive --prefix=<name>/ <tag>` 都能得到**逐文件内容相同**的包。
+# 注意口径：能承诺的是「逐文件内容相同」（Git 对象指纹一致），**不是「逐字节相同」**——
+# zip 的条目时间戳取构建机器所在时区的时间，同一个 tag 在 UTC 与 GMT+8 打出的容器字节
+# 会差「条目数 × 2」处。所以断言打在内容层（见 .github/check_zip.py）。
+#
+# zip 的顶层目录名取该 tag 的 `SKILL.md` 里的 `name`。这点是关键：
+# 平台为 tag 自动生成的 "Source code" 归档，顶层目录是 `{仓库名}-{tag}`，
+# 分隔符是**点号**；而技能规范要求 `name` 与目录名一致，且**点号非法**。
+# 直接下载自动归档再手工改名很容易漏，所以这里附一个解压即可用的 zip。
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: "填 all 才会执行：为全部历史 tag 补建 Release"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 建 Release 并附 zip
+    runs-on: ubuntu-22.04
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      # 钉 v5 而不是最新的 v7：v5 是**第一个**以 Node 24 为默认的大版本，已足够消除
+      # 运行时弃用警告；而 v6 把凭据从 `.git/config` 改存到单独文件，本工作流下面要执行
+      # `git fetch origin main`，依赖的正是检出动作持久化的凭据 —— 在无法本地复现 CI 的
+      # 前提下，不值得为「更新」冒这个行为变化。
+      - uses: actions/checkout@v5
+        with:
+          # 回填要能枚举全部 tag；同时要能读到主分支上的 CHANGELOG
+          fetch-depth: 0
+
+      - name: 确定要发布的 tag
+        id: plan
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.backfill }}" != "all" ]; then
+              echo "未传 backfill=all，本次不做事。"
+              echo "tags=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            tags="$(git tag --list | sort -V | tr '\n' ' ')"
+            echo "回填模式，共 $(git tag --list | wc -l) 个 tag"
+          else
+            tags="${{ github.ref_name }}"
+            echo "tag 推送模式：$tags"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - name: 逐个建 Release（已存在则跳过）
+        if: steps.plan.outputs.tags != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+
+          # CHANGELOG 统一从**默认分支**取 —— 它是唯一含全部版本小节的副本：
+          # 早期 tag 可能根本没有 CHANGELOG.md，个别副本也可能被截断过。
+          git fetch --quiet origin main
+          git show FETCH_HEAD:CHANGELOG.md > /tmp/CHANGELOG.md
+
+          LATEST="$(git tag --list | sort -V | tail -n1)"
+          echo "最新 tag（将标为 Latest）：$LATEST"
+
+          for TAG in ${{ steps.plan.outputs.tags }}; do
+            [ -n "$TAG" ] || continue
+            echo "──────── $TAG ────────"
+
+            # tag 名守卫：只处理 `主.次` 形态的版本 tag
+            if ! printf '%s' "$TAG" | grep -qE '^[0-9]+\.[0-9]+$'; then
+              echo "跳过：不是版本号形态的 tag"
+              continue
+            fi
+
+            # 幂等：已存在就跳过，重复触发不会报错
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "跳过：Release 已存在"
+              continue
+            fi
+
+            NAME="$(git show "$TAG:SKILL.md" | sed -n 's/^name:[[:space:]]*//p' | head -n1)"
+            if [ -z "$NAME" ]; then
+              echo "!! $TAG 的 SKILL.md 里读不到 name" >&2
+              exit 1
+            fi
+
+            ZIP="/tmp/$NAME.zip"
+            git archive --format=zip --prefix="$NAME/" -o "$ZIP" "$TAG"
+            python3 .github/check_zip.py "$ZIP" "$NAME" "$TAG"
+
+            # CHANGELOG 小节映射：早期版本可能没有同名小节。
+            # 这里只做同名匹配；若历史版本的标题写法不同，在此加一份映射表。
+            SEC="$TAG"
+            awk -v want="## $SEC" '$0 == want { f = 1; next } f && /^## / { exit } f' \
+              /tmp/CHANGELOG.md > /tmp/section.md
+
+            {
+              printf '> 下载下面的 `%s.zip`，解压后把整个目录放进运行时的技能目录。\n' "$NAME"
+              printf '> **目录名必须保持 `%s`**（= `SKILL.md` 里的 `name` 字段），否则校验不通过。\n\n' "$NAME"
+
+              if [ "$TAG" != "$LATEST" ]; then
+                printf '> ⚠️ **历史版本**，能力不完整，正常使用请取最新版 `%s`。\n\n' "$LATEST"
+              fi
+
+              if [ -s /tmp/section.md ]; then
+                cat /tmp/section.md
+              else
+                printf '本版本无独立小节，完整记录见 CHANGELOG。\n'
+              fi
+
+              printf -- '\n---\n\n完整变更记录见 `CHANGELOG.md`：\n'
+              printf 'https://github.com/%s/blob/main/CHANGELOG.md\n' "$GITHUB_REPOSITORY"
+            } > /tmp/notes.md
+
+            LATEST_FLAG="--latest=false"
+            if [ "$TAG" = "$LATEST" ]; then
+              LATEST_FLAG="--latest"
+            fi
+
+            gh release create "$TAG" "$ZIP" \
+              --title "$TAG" \
+              --notes-file /tmp/notes.md \
+              "$LATEST_FLAG"
+
+            echo "已发布 $TAG（资产 $NAME.zip）"
+          done
+
+      - name: 汇总线上 Release
+        if: steps.plan.outputs.tags != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          echo "==== 当前 Release 列表 ===="
+          gh release list --limit 50

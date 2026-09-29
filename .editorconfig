@@ -1,0 +1,18 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.md]
+# Markdown 里的行尾双空格是「硬换行」，不能自动裁掉
+trim_trailing_whitespace = false
+
+[*.{py,yml,yaml,json,cff}]
+indent_style = space
+indent_size = 2
+
+[*.py]
+indent_size = 4

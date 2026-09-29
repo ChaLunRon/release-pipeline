@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "如果使用本技能，请按下面的信息引用。"
+title: "release-pipeline —— 发布与回验流水线"
+abstract: >-
+  把本地的东西整理成正确的版本、发布到 GitHub、并逐项证明「线上与本地一致」的
+  端到端流水线：输入形态判断、快照号位取证与仓库重建、可发布性自检、
+  网络通路分层诊断、令牌权限配齐、凭据最小化、精确 ref 推送、CI 与自动发布、
+  不可变发布、历史 Release 回填、九项回验。
+  附带三条把「换一台机器就误导」的经验做成机器判据的可移植性规则。
+authors:
+  - family-names: ChaLunRon
+    given-names: ChaLunRon
+    email: 201579029+ChaLunRon@users.noreply.github.com
+repository-code: "https://github.com/ChaLunRon/release-pipeline"
+url: "https://github.com/ChaLunRon/release-pipeline"
+license: MIT
+type: software
+keywords:
+  - agent-skill
+  - github
+  - release-automation
+  - ci
+  - verification
+  - versioning
+version: 2.0
+date-released: "2026-09-29"

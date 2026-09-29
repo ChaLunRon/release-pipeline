@@ -1,0 +1,30 @@
+# Python 缓存 —— 绝不能进发布物（自检器有一条规则专门守它）
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 打包与构建产物
+build/
+dist/
+*.egg-info/
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 本地回验的临时产物
+tags.json
+baseline*.json
+
+# 密钥与凭据 —— 任何情况下都不要提交
+.env
+*.pem
+*.key

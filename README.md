@@ -1,0 +1,147 @@
+# release-pipeline
+
+![version](https://img.shields.io/badge/version-2.0-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
+![python](https://img.shields.io/badge/python-3.8%2B-blue)
+[![validate](https://github.com/ChaLunRon/release-pipeline/actions/workflows/validate.yml/badge.svg)](https://github.com/ChaLunRon/release-pipeline/actions/workflows/validate.yml)
+
+把本地的东西**整理成正确的版本、发布到 GitHub、再逐项证明「线上与本地一致」**的端到端流水线。
+
+它不是「`git push` 一下就完事」，而是十一个阶段：形态判断 → 快照号位取证（可选）→
+可发布性自检 → 网络通路 → 令牌权限 → 凭据最小化 → 精确推送 → CI →
+历史 Release 回填 → 九项回验 → 留档。
+
+## 它接得住两种输入
+
+| 手里的东西 | 走法 |
+|---|---|
+| **已经是一个 git 仓库** | 直接进阶段 2 |
+| **一堆并列的版本快照**（号位来自「第几个保存的」，跟内容对不上） | 先做阶段 1 的号位取证：判出真实版本 → 重建成带 tag 的线性历史 |
+| **一个普通项目**（非 Agent Skill） | 同样走阶段 2；只是「命名三条一致」这类 Skill 专属判据按你的项目约定替换 |
+
+## 安装
+
+把整个目录放进运行时的技能目录（目录名**必须**保持 `release-pipeline`，
+与 `SKILL.md` 里的 `name` 字段一致）：
+
+```bash
+git clone https://github.com/ChaLunRon/release-pipeline.git
+# 或下载 Releases 里按 name 打了前缀的 zip，解压即可
+```
+
+> 若你 `git clone` 到别的目录名（例如把本仓库放进一个合集仓库），
+> `scripts/selfcheck.py` 会报「`name` 与所在目录名不一致」—— 把目录改回
+> `release-pipeline` 即可。CI 里用的是同一套判据（见 `.github/workflows/validate.yml`）。
+
+## 快速开始
+
+```bash
+# 1) 推送之前：留一份远端 ref 基线（第 3 项回验要用）
+python scripts/verify_publish.py --owner <owner> --repo <repo> --write-baseline tags.json
+
+# 2) 发布前自检（含可移植性规则）
+python scripts/selfcheck.py . --quiet
+
+# 3) 推送之后：九项回验
+python scripts/verify_publish.py --owner <owner> --repo <repo> \
+    --local . --tag 2.0 --baseline tags.json
+```
+
+两个脚本都是**纯标准库**，无需安装任何第三方依赖。
+
+## 它解决什么问题
+
+| 你大概率遇到过的现象 | 本技能给的判据 |
+|---|---|
+| 推送「零输出 + 被中断」，不知道成没成 | 症状有两个成因（凭据管理器弹窗等人 / 管道炸掉吞输出）；用「远端 ref 真的变了吗」做旁证 |
+| 旧 tag 推上去了、新 tag 被拒 | 缺 `workflow` 权限 —— 「部分 ref 成功」时先查权限，别先查网络 |
+| 强推 tag 被平台拒绝 | 仓库开了**不可变发布**，已发布的 tag 与资产锁死 ⇒ 只能顺延号位 |
+| CI 报「目录名与 `name` 不一致」 | 检出目录由仓库名决定；用 `path: _checkout` + 改名，不靠放宽规则 |
+| 列表里挂着一个红色 run，不知道要不要修 | 历史运行只读、不重算；只看最新一次的 `conclusion` 与 `head_sha` |
+| 同一个 tag 在两台机器上打出的包哈希不同 | zip 条目时间戳跟随构建机器所在时区 ⇒ 断言只能打在**内容层** |
+| 归档比对报「全部文件都不一致」 | 在不含 `.git` 的目录里跑 `ls-tree` 会取到空集；改用手算 Git 对象指纹 |
+| 改过文件却「没有改动」可提交 | 体积与修改时间都相同 ⇒ 命中 stat cache；删 `.git/index` 强制重哈希 |
+| 一堆快照号位对不上内容 | 三路取证（文件集合 / 特征串 / 相似度）判真实版本，号位按内容定 |
+
+## 三条可移植性规则（本仓库的自我约束）
+
+技能会在多台机器、多个网络上被使用。**把某一台机器在某一时刻的样子写成平台的属性，
+换一台机器就变成误导** —— 所以这三条被做成了机器判据，写进 `scripts/selfcheck.py`：
+
+| 规则 | 级别 | 判据 |
+|---|---|---|
+| 硬编码的绝对路径 | FAIL | 文档与配置里出现「盘符 + 反斜杠」路径，或家目录形态的绝对路径 |
+| 地址字面量 | FAIL | 任何文件里出现 IPv4 字面量，且不在白名单内（回环地址 + 文档保留段） |
+| 第一人称环境指代 | WARN | 文档里出现没有先行词的指代写法；确实要举例说明被禁写法的行可加豁免标记，**标记数量会被打印** |
+
+改写方法与对照表见 [`references/portable-writing.md`](references/portable-writing.md)。
+
+## 仓库结构
+
+```
+release-pipeline/
+├── SKILL.md                          技能主文件（十一阶段流水线 + 铁律 + 检查清单）
+├── references/                       按主题展开的细则
+│   ├── audit-and-rebuild.md          快照号位取证与仓库重建
+│   ├── first-publish.md              首次发布：默认分支 / 建仓 / 门面 / 身份
+│   ├── network-diagnosis.md          网络通路分层诊断
+│   ├── token-and-credentials.md      令牌权限、凭据最小化、两条执行路径
+│   ├── ci-and-release.md             CI 与自动发布（含两个工作流模板）
+│   ├── verification.md               九项回验的可执行口径
+│   └── portable-writing.md           可移植写法（剔除环境专属值）
+├── scripts/
+│   ├── selfcheck.py                  结构规范 + 可移植性自检
+│   └── verify_publish.py             推送后九项回验
+├── tests/                            离线单元测试
+└── .github/
+    ├── workflows/validate.yml        校验（只读权限）
+    ├── workflows/release.yml         发布（写权限）
+    └── check_zip.py                  发布物与 tag 的逐文件一致性自检
+```
+
+## 自检与测试
+
+```bash
+python scripts/selfcheck.py .          # 结构规范 + 可移植性
+python -m unittest discover -s tests -v
+```
+
+- 自检器与单测都是**离线可跑**的：测试用桩替换网络出口，断网或挂代理后结果不变。
+- 自检器里有一组「检查器自身不得含有被检查字面量」的用例 —— 防的是「一次全局替换
+  把检查规则改坏，而它仍然打印通过」这种静默失效。
+- 声称支持的 Python 版本由 CI 矩阵兑现（见 [`.github/workflows/validate.yml`](.github/workflows/validate.yml)）。
+
+> ⚠️ 自检器有一条「工作区不得有 `__pycache__`」的规则，而 `unittest` 会顺手生成缓存。
+> 本地跑测试时用 `PYTHONDONTWRITEBYTECODE=1`（CI 里已在 job 级设置），
+> 或在打包前清一次缓存。
+
+## 发布
+
+推 tag 会自动建 Release 并附上从该 tag 现算的 zip：
+
+```bash
+git push origin main
+git push origin <新tag>
+```
+
+历史 tag 的回填用 `workflow_dispatch` + `backfill=all`（幂等，已存在的 Release 会跳过）。
+
+**口径**：发布物可以由 tag 重现，指的是**逐文件内容相同**，不是逐字节相同 ——
+zip 的条目时间戳取构建机器所在时区的时间。所以流水线里的断言打在内容层
+（`.github/check_zip.py`），打在容器哈希上会得到一个随机变红的结果。
+
+⚠️ 仓库若开启**不可变发布**，Release 一旦发出，资产与 tag 就被平台锁死，
+**没有「就地改一改」这个选项** —— 想改只能顺延号位。发布前的最后一次自检要格外认真。
+
+## 版本
+
+| 版本 | 日期 | 内容 |
+|---|---|---|
+| `2.0` | 2026-09-29 | 更名并扩为端到端：并入快照号位取证与仓库重建（原另一技能的内核）、新增首次发布一篇、新增「不可变发布」与两条执行路径、补入 stat cache 与复制语义两个陷阱 |
+| `1.0` | 2026-09-28 | 首个版本（名 `github-upload-pipeline`）：九阶段流水线与九项回验，三条可移植性规则做成机器判据 |
+
+变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
+
+## 许可
+
+MIT，见 [`LICENSE`](LICENSE)。
