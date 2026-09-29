@@ -295,7 +295,8 @@ class TestCheckCi(Base):
     HEAD_RUN = 200
     OLD_RUN = 100
 
-    def _fake(self, conclusion, head, annotations=0, extra_checkruns=()):
+    def _fake(self, conclusion, head, annotations=0, extra_checkruns=(),
+              status="completed"):
         """check run 要用 `details_url` 表明它**归属于哪个 run**。
 
         第 8b 项按归属取数，不再按 app 名字 —— 因为平台给依赖更新机器人建的 check run
@@ -307,10 +308,10 @@ class TestCheckCi(Base):
             if "/actions/runs" in url:
                 return {"workflow_runs": [
                     {"id": self.OLD_RUN, "name": "validate", "run_number": 1,
-                     "conclusion": "success", "head_sha": "old",
+                     "conclusion": "success", "head_sha": "old", "status": "completed",
                      "created_at": "2026-01-01T00:00:00Z"},
                     {"id": head_run, "name": "validate", "run_number": 2,
-                     "conclusion": conclusion, "head_sha": head,
+                     "conclusion": conclusion, "head_sha": head, "status": status,
                      "created_at": "2026-01-02T00:00:00Z"},
                 ]}
             runs = [{"name": "validate", "app": {"slug": "github-actions"},
@@ -397,6 +398,36 @@ class TestCheckCi(Base):
         res = vp.Result()
         vp.check_ci(res, "o", "r", "abc", None)
         self.assertEqual(len(res.fails), 1)
+
+    def test_unfinished_run_is_pending_not_failed(self):
+        """回归（2026-09-29 真实发布上的实况）：刚推完就回验，`conclusion` 是 `None`。
+
+        那不是失败 —— 同一次回验里「资产与 tag 逐文件一致」与「latest 落在最高版本」
+        两项已经 PASS，说明只是流水线还没跑完。判 FAIL 会让人以为线上坏了。
+        """
+        vp.fetch_json = self._fake(None, "abc", status="in_progress")
+        res = vp.Result()
+        vp.check_ci(res, "o", "r", "abc", None)
+        self.assertEqual(len(res.fails), 0, res.items)
+        self.assertEqual([(i["no"], i["status"]) for i in res.items],
+                         [(8, vp.PENDING), ("8b", vp.PENDING)])
+        self.assertIn("尚未结束", [i for i in res.items if i["no"] == 8][0]["detail"])
+
+    def test_unfinished_run_does_not_turn_zero_annotations_into_a_pass(self):
+        """run 没结束时报「注解全 0」是典型的软失败 —— 那时注解数还不是终值。"""
+        vp.fetch_json = self._fake(None, "abc", annotations=0, status="queued")
+        res = vp.Result()
+        vp.check_ci(res, "o", "r", "abc", None)
+        self.assertEqual(len(res.passes), 0, res.items)
+        self.assertIn("还不是终值", [i for i in res.items if i["no"] == "8b"][0]["detail"])
+
+    def test_completed_run_without_conclusion_is_still_a_failure(self):
+        """**收窄口径 ≠ 放宽**：已经结束却没有结论，仍然是失败。"""
+        vp.fetch_json = self._fake(None, "abc", status="completed")
+        res = vp.Result()
+        vp.check_ci(res, "o", "r", "abc", None)
+        self.assertEqual([i["no"] for i in res.fails], [8])
+        self.assertEqual(len(res.pending), 0)
 
     def test_annotation_count_reported_as_failure(self):
         vp.fetch_json = self._fake("success", "abc", annotations=1)
@@ -589,13 +620,139 @@ class TestCredentialResidue(Base):
         self.assertIn("逐文件读全", res.passes[0]["detail"])
 
 
+class _Http404(Exception):
+    """`urllib` 的 `HTTPError` 的形状：带 `.code` 与 `.reason`。只借形状，不碰真网络。"""
+    code = 404
+
+    def __init__(self, reason=""):
+        super(_Http404, self).__init__(reason)
+        self.reason = reason
+
+
+class _Http403(Exception):
+    code = 403
+
+    def __init__(self, reason=""):
+        super(_Http403, self).__init__(reason)
+        self.reason = reason
+
+
+class TestPlatformSettings(Base):
+    """第 10b 项：平台设置的**只读核验**。
+
+    存在理由是一条实测更正：曾把「平台侧设置」写成
+    「`security_and_analysis` 只对管理员返回 ⇒ 无法核验」，于是维护清单里有三项
+    永远标着「无法核验」。**一项永远亮着的「无法核验」和永远亮着的红叉一样，
+    会训练人忽略它** —— 而实测（2026-09-29）有管理员凭据时这些端点读得到、也写得动。
+    """
+
+    BASE = "https://api.github.com/repos/o/r"
+    ENABLED = {"secret_scanning": {"status": "enabled"},
+               "secret_scanning_push_protection": {"status": "enabled"}}
+
+    def _fake(self, sec, pvr=True, immutable=None, rulesets=None, protection=None,
+              fork="first_time_contributors", broken=()):
+        def fake(url, token=None):
+            if url in broken:
+                raise _Http404("Not Found")
+            if url == self.BASE:
+                return {"security_and_analysis": sec} if sec is not None else {}
+            if url.endswith("/private-vulnerability-reporting"):
+                return {"enabled": pvr}
+            if url.endswith("/automated-security-fixes"):
+                return {"enabled": False, "paused": False}
+            if url.endswith("/immutable-releases"):
+                # **未启用就是 404，不是 `enabled: false`。**
+                if immutable is None:
+                    raise _Http404("Not Found")
+                return {"enabled": immutable, "enforced_by_owner": False}
+            if url.endswith("/rulesets"):
+                return rulesets if rulesets is not None else []
+            if "/branches/" in url:
+                if protection is None:
+                    raise _Http404("Not Found")
+                return {"required_status_checks": {}}
+            if url.endswith("/fork-pr-contributor-approval"):
+                return {"approval_policy": fork}
+            raise AssertionError("未预期的端点：%s" % url)
+        return fake
+
+    def _check(self, **kw):
+        vp.fetch_json = self._fake(**kw)
+        res = vp.Result()
+        vp.check_platform_settings(res, "o", "r", "token-stub")
+        self.assertEqual(len(res.items), 1, res.items)
+        return res.items[0], res
+
+    def test_both_gates_open_pass_and_the_rest_are_reported_only(self):
+        item, _ = self._check(sec=self.ENABLED)
+        self.assertEqual(item["status"], vp.PASS)
+        self.assertIn("只报不判", item["detail"])
+        # 404 = 功能未启用，**不是**「取数失败」—— 两者读法完全不同
+        self.assertIn("不可变发布=未启用（404）", item["detail"])
+        self.assertIn("分支保护=无（404）", item["detail"])
+        self.assertIn("外部贡献者批准=first_time_contributors", item["detail"])
+
+    def test_push_protection_off_fails_and_says_why(self):
+        sec = dict(self.ENABLED, secret_scanning_push_protection={"status": "disabled"})
+        item, res = self._check(sec=sec)
+        self.assertEqual(item["status"], vp.FAIL)
+        self.assertIn("推送保护", item["detail"])
+        self.assertIn("已泄露", item["detail"])
+        self.assertEqual(len(res.passes), 0)
+
+    def test_missing_security_field_is_skipped_not_passed(self):
+        """字段缺失 = 没有管理员权限 ⇒ **无法核验**，绝不能写成「没问题」。"""
+        item, res = self._check(sec=None)
+        self.assertEqual(item["status"], vp.SKIP)
+        self.assertIn("无法核验", item["detail"])
+        self.assertIn("管理员", item["detail"])
+        self.assertEqual(len(res.passes), 0)
+
+    def test_unknown_gate_status_is_skipped(self):
+        """只读得到一个闸的状态 ⇒ 仍然是「无法判断」，不许降级成通过。"""
+        item, _ = self._check(sec={"secret_scanning": {"status": "enabled"}})
+        self.assertEqual(item["status"], vp.SKIP)
+        self.assertIn("推送保护", item["detail"])
+
+    def test_unreadable_repo_is_skipped(self):
+        item, _ = self._check(sec=self.ENABLED, broken=(self.BASE,))
+        self.assertEqual(item["status"], vp.SKIP)
+        self.assertIn("这不是通过", item["detail"])
+
+    def test_one_dead_endpoint_does_not_sink_the_item(self):
+        """某个端点挂了，只把那一格写成「读不到」，其余照报 —— 硬判不受影响。"""
+        item, _ = self._check(sec=self.ENABLED, broken=(self.BASE + "/rulesets",))
+        self.assertEqual(item["status"], vp.PASS)
+        self.assertIn("规则集=读不到", item["detail"])
+
+    def test_reason_is_kept_so_a_rate_limit_is_not_read_as_no_permission(self):
+        """`403` 既可能是限流、也可能是没权限 —— 只留状态码等于把两种处置方式混成一条。
+
+        这条是实测撞出来的：匿名跑回验时被平台限流，报告只写「HTTP 403」，
+        读起来像权限问题，会把人引去换凭据（而其实等一会儿就行）。
+        """
+        def fake(url, token=None):
+            raise _Http403("rate limit exceeded")
+
+        vp.fetch_json = fake
+        res = vp.Result()
+        vp.check_platform_settings(res, "o", "r", None)
+        self.assertEqual(res.items[0]["status"], vp.SKIP)
+        self.assertIn("rate limit exceeded", res.items[0]["detail"])
+
+
 class TestInterruptionSemantics(Base):
     """回归：原先「执行成功才登记」，于是第 4 项抛异常时第 5–9 项**从报告里消失** ——
     报告既不显示它们失败，也不显示它们被跳过。这直接违反了本技能自己的纪律
     「跳过必须显式打印，并在汇总里单独计数」。"""
 
-    PLAN_NUMBERS = (1, 2, 3, 4, 5, 6, 7, 8, "8b", 9, "9b")
-    ALL_NUMBERS = PLAN_NUMBERS + (10,)
+    # **号码表从 `CHECK_PLAN` 现推**，不要在这里抄一份。
+    # 抄一份的话，每加一个检查项都要回来改这个用例 —— 而漏改的表现是
+    # 「用例还在、却已经查不到新项」，正好放过它本该守住的那件事。
+    # 第 10 项（凭据复查）在本机就能跑，不属于「远端项」。
+    PLAN_NUMBERS = tuple(no for no, _ in vp.CHECK_PLAN if no != 10)
+    ALL_NUMBERS = tuple(no for no, _ in vp.CHECK_PLAN)
 
     def test_exception_leaves_every_item_accounted_for(self):
         repo = make_repo(self.tmp, tag="1.0")
@@ -618,8 +775,8 @@ class TestInterruptionSemantics(Base):
         # 凭据复查在本机就能跑，它应当照常出结论（通过或跳过都行，但不能消失）
         self.assertRegex(out, r"\[(PASS|FAIL|SKIP)\] 10 ")
         self.assertIn("远端检查中断", out)
-        # 汇总必须体现「有 11 项没跑」，而不是让人从「1 通过」里猜
-        self.assertIn("11 跳过", out)
+        # 汇总必须体现「有 N 项没跑」，而不是让人从「1 通过」里猜
+        self.assertIn("%d 跳过" % len(self.PLAN_NUMBERS), out)
 
     def test_plan_covers_every_numbered_item_once(self):
         numbers = [no for no, _ in vp.CHECK_PLAN]
@@ -790,7 +947,11 @@ class TestOfflineCli(Base):
         out = buf.getvalue()
         self.assertEqual(code, 0, out)
         self.assertIn("跳过", out)
-        self.assertNotIn("九项回验全部通过", out)
+        # ⚠️ 原先这里写的是 `九项回验全部通过` —— 而脚本从来不打这句，
+        # 于是这条断言**永远不会失败**（一条测不到东西的用例比没有更糟）。
+        # 断言必须打在脚本真会输出的那句话上。
+        self.assertNotIn("回验全部通过（", out)
+        self.assertIn("%d 跳过" % (len(vp.CHECK_PLAN) - 1), out)
 
     def test_requires_tag(self):
         repo = make_repo(self.tmp, tag="1.0")
@@ -826,6 +987,49 @@ class TestResultBookkeeping(unittest.TestCase):
         res.add(2, "b", vp.FAIL, "d")
         res.add(3, "c", vp.SKIP)
         self.assertEqual((len(res.passes), len(res.fails), len(res.skips)), (1, 1, 1))
+
+    def test_pending_is_counted_separately_from_both(self):
+        res = vp.Result()
+        res.add(1, "a", vp.PASS)
+        res.add(2, "b", vp.PENDING, "跑着呢")
+        self.assertEqual((len(res.passes), len(res.fails), len(res.pending)), (1, 0, 1))
+        line, notes, code = vp.summarize(res)
+        self.assertEqual(code, 0, "「进行中」不是失败，不该让整轮回验返回非零")
+        self.assertIn("1 进行中", line)
+        # 标记取带括号的整句 —— 结论行里「这**不等于**全部通过」这种否定句
+        # 也含「全部通过」四个字，拿它当标记会得到一个永远为真的断言。
+        self.assertNotIn("回验全部通过（", " ".join(notes))
+        self.assertIn("进行中", " ".join(notes))
+
+    def test_full_pass_is_claimed_only_when_there_is_nothing_else(self):
+        res = vp.Result()
+        res.add(1, "a", vp.PASS)
+        _, notes, code = vp.summarize(res)
+        self.assertEqual(code, 0)
+        self.assertIn("回验全部通过（", notes[0])
+
+    def test_skips_suppress_the_full_pass_wording(self):
+        res = vp.Result()
+        res.add(1, "a", vp.PASS)
+        res.add(2, "b", vp.SKIP)
+        _, notes, code = vp.summarize(res)
+        self.assertEqual(code, 0)
+        self.assertNotIn("回验全部通过（", " ".join(notes))
+
+    def test_failure_wins_over_everything(self):
+        res = vp.Result()
+        res.add(1, "a", vp.PASS)
+        res.add(2, "b", vp.PENDING)
+        res.add(3, "c", vp.FAIL)
+        _, notes, code = vp.summarize(res)
+        self.assertEqual(code, 1)
+        self.assertEqual(notes, ["回验未通过"])
+
+    def test_report_order_is_numeric_not_lexicographic(self):
+        """「第 10 项」必须排在「第 2 项」之后 —— 否则报告看起来像有重复或漏项，
+        而这恰恰是这份报告最不该制造的效果。"""
+        order = sorted([1, 10, "10b", 2, 9, "9b", "8b", 8, "!"], key=vp.report_order)
+        self.assertEqual(order, ["!", 1, 2, 8, "8b", 9, "9b", 10, "10b"])
 
 
 class TestCheckerSelfConsistency(unittest.TestCase):

@@ -1,6 +1,6 @@
 # release-pipeline
 
-![version](https://img.shields.io/badge/version-4.1-blue)
+![version](https://img.shields.io/badge/version-5.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![python](https://img.shields.io/badge/python-3.8%2B-blue)
 [![validate](https://github.com/ChaLunRon/release-pipeline/actions/workflows/validate.yml/badge.svg)](https://github.com/ChaLunRon/release-pipeline/actions/workflows/validate.yml)
@@ -43,9 +43,9 @@ python scripts/verify_publish.py --owner <owner> --repo <repo> --write-baseline 
 # 2) 发布前自检（含可移植性规则）
 python scripts/selfcheck.py . --quiet
 
-# 3) 推送之后：九项回验
+# 3) 推送之后：九项回验 + 四项附带核验
 python scripts/verify_publish.py --owner <owner> --repo <repo> \
-    --local . --tag 4.1 --baseline tags.json --archive-root history/
+    --local . --tag 5.0 --baseline tags.json --archive-root history/
 ```
 
 两个脚本都是**纯标准库**，无需安装任何第三方依赖。
@@ -71,6 +71,8 @@ python scripts/verify_publish.py --owner <owner> --repo <repo> \
 | 每次推送都报「历史被动过」，可一个 tag 都没动 | 拿**全部 ref** 去比「旧 tag 有没有变」——`HEAD`/分支本来就会被推送移动，关掉一个 PR 还会删掉 `pull/*` ⇒ 只比 `refs/tags/*` |
 | 回验只跑了几项就「中断」，后面全是「未执行」 | 一项抛异常把整段带崩了 ⇒ 逐项隔离，异常算那一项失败、其余照跑 |
 | 注解数报错，点进去却是平台/机器人的通知 | 平台给依赖更新机器人建的 check run，**app 也是 `github-actions`** ⇒ 按**归属**（`details_url` 里的 run id）过滤，不按 app 名字 |
+| 刚推完就回验，CI 那项报失败，点进去却一切正常 | 运行结束前 `conclusion` 是 `None`、不是 `failure` ⇒ 单列成「进行中」：**既不算失败也不算通过**，稍后重跑即可 |
+| 想知道平台的推送保护 / 规则集到底开没开 | 有管理员凭据时这些端点读得到 ⇒ 回验会**只读核验**；没有权限时明确报「无法核验」，**不写成通过**、也不写成「未开启」 |
 | 陈旧的 issue / PR 无人清理 | 交给定期跑的清理机制，配好豁免标签与每小时上限（平台的滥用防护会限流） |
 | 「读起来专业但经不起推敲」的贡献越来越多 | 提交成本趋零、评审成本不变 ⇒ 先写贡献政策（披露 + 人类负责），再卡「**所有**外部贡献者需批准」 |
 | 发布凭据是长期令牌，怕泄露 | 换成 OIDC 信任发布：仓库里不再留任何长期发布令牌（主流注册表 2025 年底已全部支持） |
@@ -115,14 +117,14 @@ release-pipeline/
 │   ├── network-diagnosis.md          网络通路分层诊断
 │   ├── token-and-credentials.md      令牌权限、凭据最小化、两条执行路径
 │   ├── ci-and-release.md             CI 与自动发布（含两个工作流模板）
-│   ├── verification.md               九项回验的可执行口径（含三项附带判定）
+│   ├── verification.md               九项回验的可执行口径（含四项附带核验）
 │   ├── maintenance-burden.md         发布之后的长期负担（一次性 / 持续 × 机器 / 人类）
 │   ├── channel-boundaries.md         两个分发渠道各自的规则与边界（消歧用）
 │   ├── withdrawal.md                 撤回 / 作废：门槛、三道闸、Release 上的三个动作
 │   └── portable-writing.md           可移植写法（剔除环境专属值）
 ├── scripts/
 │   ├── selfcheck.py                  结构规范 + 可移植性 + 发布前隐私扫描
-│   └── verify_publish.py             推送后九项回验（+ 三项附带判定）
+│   └── verify_publish.py             推送后九项回验（+ 四项附带核验）
 ├── tests/                            离线单元测试（含工作流检查器的用例）
 └── .github/
     ├── workflows/validate.yml        校验（只读权限）
@@ -182,6 +184,7 @@ zip 的条目时间戳取构建机器所在时区的时间。所以流水线里�
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| `5.0` | 2026-09-29 | **新增核验能力**：① 新状态「**进行中**」—— CI 未结束时 `conclusion` 是 `None`，原先被报成失败（实测刚推完必然撞上它），现在单列计数，**既不计入失败也不算通过**，且「已结束却没结论」仍走失败分支；② 新检查项「**平台安全设置只读核验**」—— 把维护清单里 3 项「无法核验」的平台开关做成可跑的检查，只有密钥扫描 / 推送保护是**硬判**（三道闸的第二道），其余**只报不判**，**读不到就写「无法核验」**；③ 错误信息带上原因（`403` 分不清限流与没权限）；④ 报告改为按数字排序（原先 `10` 会插在 `1` 后面）；⑤ 修掉一条**永远为真**的断言与一张手抄死的检查项号码表 |
 | `4.1` | 2026-09-29 | 拿 `4.0` 的**真实发布**跑一遍回验，又抓到四个假阳性与一处环境缺口：**第 3 项**拿全部 ref 当「旧 tag」比（推送必然移动 `HEAD`/`main`，关掉 PR 又会删 `pull/*`）；**第 6 项**遇到「归档目录名不是本仓库的 tag」（`history/1.0/` 是前身项目的快照）直接抛异常，把第 7–9b 项一起带崩；**第 8b 项**按 app 名字过滤 —— 而平台给机器人建的 check run **app 也是 `github-actions`**；**第 9 项**在主机名被 `hosts` 劫持的环境下取不到资产。改为：只比 tag / 缺 tag 就跳过该条 / 按**归属**过滤 / 新增 `--connect-host`；并给全部远端项加**逐项隔离**。 |
 | `4.0` | 2026-09-29 | 第一次连上真实远端之后的收口：**新增发布前隐私扫描**（第四个 FAIL 级判据，带白名单）与**撤回 / 作废流程**（[`references/withdrawal.md`](references/withdrawal.md) + 主文件新节）；**修掉回验脚本的三个假阳性**（tag 集合没剥解引用后缀 / CI 取「最新 run」而非「本次提交的 run」/ 注解统计不分来源），全部写成回归用例；依赖更新机器人加 `ignore` 大版本；四条线上实测经验入库 |
 | `3.1` | 2026-09-29 | 把 3.0 评审暴露的问题逐条落地：**裁决两处跨技能的数字冲突**（描述字段上限 / 版本号形态），新增 [`references/channel-boundaries.md`](references/channel-boundaries.md) 说明「两个分发渠道各有各的规则，不是同一问题的两种解法」；**修复回验脚本的六个实现缺陷**（异常时后续项会从报告里消失、资产不按文件名匹配、凭据扫描截断后仍报通过等）；工作流的 Action 固定到完整 SHA，并补上真正会跑的一致性检查（`.github/lint_workflows.py`）；维护清单加「**本仓库现状**」列，让未达标可见 |

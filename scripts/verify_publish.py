@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-推送后九项回验（纯标准库，无第三方依赖）。
+推送后九项回验 + 四项附带核验（纯标准库，无第三方依赖）。
 
     # 0) 推送**之前**先留一份基线，否则第 3 项无从比较
     python scripts/verify_publish.py --owner <owner> --repo <repo> --write-baseline tags.json
@@ -21,6 +21,16 @@
 **「跳过」不等于「通过」。** 缺基线、缺权限、离线时相应项会被跳过，但一律**显式打印**
 并单独计数；只要有一项被跳过，结论就不会写「全部通过」。任何软失败（异常被吞、
 返回兜底值）都不算通过。
+
+**「进行中」是第三种状态，不是失败。** CI 的 `conclusion` 在运行结束前是 `None` ——
+刚推完就立刻回验，**必然**撞上它（实测：`validate #5 conclusion=None`，而同一次里
+「资产与 tag 一致」「latest 落在最高版本」两项已 PASS，说明流水线只是还没跑完）。
+把它判成 FAIL 会让人以为线上坏了，于是它单列成 `PENDING`：不计入失败，也不算通过，
+措辞里写明「稍后重跑即可」。
+
+**编号约定**：`1`–`9` 是核心九项；`8b` / `9b` / `10` / `10b` 是**附带核验**
+（编号带字母后缀，或排在九项之后）。报告按数字排序，不按字符串排序 ——
+否则「第 10 项」会插在「第 1 项」后面。
 
 **先全部登记，再逐项改写。** 主流程会先把回验计划里的每一项登记为「未执行」，
 跑完一项改写一项。这样一次远端异常（限流 / 403 / 超时）只会让后面的项显示为
@@ -50,7 +60,7 @@ import zipfile
 DEFAULT_API = "https://api.github.com"
 GIT_TIMEOUT = 120
 
-PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
+PASS, FAIL, SKIP, PENDING = "PASS", "FAIL", "SKIP", "PENDING"
 
 # 「CI 跑绿了」指的是**校验工作流**跑绿了，不能取「全部工作流里最新的一条」：
 # 推 tag 之后发布工作流往往比校验更晚结束，于是「最新一条」通常是发布工作流 ——
@@ -86,9 +96,23 @@ CHECK_PLAN = (
     (9, "Release 资产与 tag 逐文件一致"),
     ("9b", "latest 落在最高版本（附带判定）"),
     (10, "凭据残留复查"),
+    ("10b", "平台安全设置（只读核验，附带判定）"),
 )
 
 CHECK_TITLES = dict((no, name) for no, name in CHECK_PLAN)
+
+
+def report_order(no):
+    """报告里的排序键：**先按数字、再按后缀**（`8` < `8b` < `9` < `10` < `10b`），
+    没有编号的（如中断标记 `!`）排在最前。
+
+    原先直接用 `str(no)` 排 ⇒ 「第 10 项」会插在「第 1 项」后面。报告是给人读的，
+    顺序错乱会让人以为有重复或漏项 —— 而这恰恰是这份报告最不该出现的效果。
+    """
+    m = re.match(r"^(\d+)(.*)$", str(no))
+    if not m:
+        return (0, 0, str(no))
+    return (1, int(m.group(1)), m.group(2))
 
 
 def _guard(res, item, fn, *a, **kw):
@@ -135,6 +159,11 @@ class Result:
     @property
     def passes(self):
         return [i for i in self.items if i["status"] == PASS]
+
+    @property
+    def pending(self):
+        """「进行中」既不是失败也不是通过 —— 结论行必须把它单列出来。"""
+        return [i for i in self.items if i["status"] == PENDING]
 
 
 # ------------------------------------------------------------------ 基础工具
@@ -522,6 +551,17 @@ def _is_workflow(run, workflow):
     return path.rsplit("/", 1)[-1] in (workflow, workflow + ".yml")
 
 
+def _unfinished(run):
+    """这个 run 还在跑吗？
+
+    第 8 项与第 8b 项**必须用同一个判据** —— 否则会出现「第 8 项说还在进行中、
+    第 8b 项却拿注解数下了结论」这种自相矛盾的报告。
+    已结束却没有结论（`status=completed` + `conclusion=None`）**不算进行中**：
+    那是真的异常，应当走失败分支。
+    """
+    return run.get("conclusion") is None and run.get("status") != "completed"
+
+
 def check_ci(res, owner, repo, expected_sha, token, workflow=CI_WORKFLOW):
     """第 8 / 8b 项：**只认本次提交**。
 
@@ -555,6 +595,13 @@ def check_ci(res, owner, repo, expected_sha, token, workflow=CI_WORKFLOW):
                 latest.get("head_sha", "")[:12], conclusion)
             if conclusion == "success":
                 res.add(8, "CI 本次提交的 run", PASS, detail)
+            elif _unfinished(latest):
+                # 刚推完必然撞上这一条。判 FAIL 会让人以为线上坏了 ——
+                # 实测（2026-09-29）：`validate #5 conclusion=None`，而同一轮里
+                # 「资产与 tag 一致」「latest 落在最高版本」两项已经 PASS。
+                res.add(8, "CI 本次提交的 run", PENDING,
+                        detail + "（status=%s）—— 该 run **尚未结束**，这不是失败，"
+                        "也不算通过；等它跑完再跑一次回验即可" % latest.get("status"))
             else:
                 res.add(8, "CI 本次提交的 run", FAIL, detail)
     # 顺带报告本次提交的注解数（判断弃用警告是否已消除）。
@@ -592,6 +639,16 @@ def check_ci(res, owner, repo, expected_sha, token, workflow=CI_WORKFLOW):
         if dropped:
             reason += "（该提交上另有 %d 个 check run，但它们不属于本工作流）" % len(dropped)
         res.add("8b", "本次提交的注解数（只算 Actions，附带判定）", SKIP, reason)
+        return
+    unfinished = [r for r in items if _is_workflow(r, workflow) and _unfinished(r)]
+    if unfinished:
+        # 注解数只有在 run 结束后才是终值 —— run 还在跑就报「注解全 0」是软失败。
+        res.add("8b", "本次提交的注解数（只算 Actions，附带判定）", PENDING,
+                "有 %d 个 `%s` 的运行尚未结束（%s）⇒ 注解数还不是终值，不能据此判定。"
+                "**这不是通过**，也不是失败；等它跑完再跑一次回验。"
+                % (len(unfinished), workflow,
+                   "、".join("#%s(status=%s)" % (r.get("run_number"), r.get("status"))
+                             for r in unfinished[:3])) + excluded)
         return
     counts = [(c.get("name"), (c.get("output") or {}).get("annotations_count")) for c in mine]
     if counts:
@@ -755,7 +812,154 @@ def check_credentials(res, repo):
                 "配置与对象库**逐文件读全**（对象库 %d 个文件），均无令牌字面量" % scanned)
 
 
+# ------------------------------------------------------------ 第 10b 项：平台设置
+
+
+def _dig(data, *path):
+    """按路径从嵌套响应里取值，取不到返回 `None`。
+
+    ⚠️ **`None` 是「读不到」，不是 `False`。** 这两者混为一谈，就会出现
+    「没读出来」被写成「没有开启」的假 FAIL —— 或者更糟，被写成「没问题」。
+    """
+    cur = data
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _yn(value, err=None):
+    if value is True:
+        return "enabled"
+    if value is False:
+        return "disabled"
+    return ("读不到(%s)" % err) if err else "未返回该字段"
+
+
+def _try_json(url, token=None):
+    """取一个端点，返回 `(data, err)`。**任何**失败都只记原因，不外抛 ——
+
+    平台设置分散在多个端点，其中一个 404（**功能未启用就是 404，不是 `false`**）
+    不该让整项变成「该检查抛异常」，也不该把别的端点一起带崩。
+    """
+    try:
+        return fetch_json(url, token), None
+    except Exception as exc:                       # 网络 / 权限 / 404 / 限流都走这里
+        code = getattr(exc, "code", None)
+        reason = str(getattr(exc, "reason", "") or "").strip()
+        # ⚠️ **必须把原因带上**：`403` 既可能是「没有权限」，也可能是
+        # 「匿名调用的次数用完了」。前者要去换凭据，后者只要等一会儿或带上令牌 ——
+        # 只留一个状态码，等于把两种完全不同的处置方式混成一条。
+        if code:
+            return None, "HTTP %s%s" % (code, (": %s" % reason) if reason else "")
+        return None, "%s: %s" % (type(exc).__name__, exc)
+
+
+# **只有这两条是硬判**，依据是本技能自己的「三道闸」：公开即已泄露、事后撤回治不了本，
+# 所以平台侧那两道闸必须是开的（第一道 = 本地发布前隐私扫描，第三道 = 建 tag 前人工清单）。
+# 其余几项各自都有真实取舍 —— 例如依赖更新的安全更新机器人会带来 PR 噪音 ——
+# 状态照实打印，但**不代替使用者拍板**。一项永远亮着的红/黄，会训练人忽略它。
+_HARD_GATES = (("secret_scanning", "密钥扫描"),
+               ("secret_scanning_push_protection", "推送保护"))
+
+
+def check_platform_settings(res, owner, repo, token, branch="main"):
+    """第 10b 项：平台安全设置的**只读核验**。
+
+    这一项的存在理由是一条实测更正：早先把「平台侧设置」写成
+    「`security_and_analysis` **只对管理员返回** ⇒ 无法核验」，于是维护清单里有三项
+    永远标着「无法核验」。**一项永远亮着的「无法核验」和永远亮着的红叉一样，
+    会训练人忽略它** —— 而实测（2026-09-29）有管理员凭据时这些端点读得到、也写得动
+    （本轮就用 API 开掉了私密漏洞上报）。
+
+    所以本项的口径是：**读得到就据实判，读不到就明确写「无法核验」**，绝不含糊过去。
+    """
+    base = "%s/repos/%s/%s" % (DEFAULT_API, owner, repo)
+    info, err = _try_json(base, token)
+    if info is None:
+        res.add("10b", CHECK_TITLES["10b"], SKIP,
+                "读仓库信息失败（%s）⇒ 无法核验平台设置。**这不是通过。**" % err)
+        return
+    sec = info.get("security_and_analysis")
+    if not isinstance(sec, dict):
+        res.add("10b", CHECK_TITLES["10b"], SKIP,
+                "响应里没有 `security_and_analysis` —— 该字段**只对管理员返回**，"
+                "说明当前凭据没有管理员权限 ⇒ **无法核验**（既不是通过，也不是失败）。"
+                "换管理员凭据再跑，或去仓库的 Security 设置里人工核对。")
+        return
+
+    states = dict((key, _dig(sec, key, "status")) for key, _ in _HARD_GATES)
+    off = [label for key, label in _HARD_GATES if states.get(key) == "disabled"]
+    unknown = [label for key, label in _HARD_GATES if states.get(key) is None]
+
+    extra = []
+
+    pvr, e = _try_json(base + "/private-vulnerability-reporting", token)
+    extra.append("私密漏洞上报=%s" % _yn(_dig(pvr, "enabled"), e))
+
+    asf, e = _try_json(base + "/automated-security-fixes", token)
+    extra.append("依赖更新的安全更新=%s" % _yn(_dig(asf, "enabled"), e))
+
+    imm, e = _try_json(base + "/immutable-releases", token)
+    # 这个端点**未启用时返回 404**（不是 `enabled: false`）—— 别把 404 读成「取数失败」。
+    if e and "404" in e:
+        extra.append("不可变发布=未启用（404）")
+    else:
+        extra.append("不可变发布=%s" % _yn(_dig(imm, "enabled"), e))
+
+    rs, e = _try_json(base + "/rulesets", token)
+    extra.append("规则集=%s" % (("读不到(%s)" % e) if rs is None else "%d 条" % len(rs)))
+
+    prot, e = _try_json(base + "/branches/%s/protection" % branch, token)
+    if e and "404" in e:
+        extra.append("分支保护=无（404）")
+    else:
+        extra.append("分支保护=%s" % ("有" if prot is not None else "读不到(%s)" % e))
+
+    fk, e = _try_json(base + "/actions/permissions/fork-pr-contributor-approval", token)
+    extra.append("外部贡献者批准=%s" % (_dig(fk, "approval_policy") if fk is not None
+                                   else "读不到(%s)" % e))
+
+    body = "、".join(extra)
+    if off:
+        res.add("10b", CHECK_TITLES["10b"], FAIL,
+                "**%s处于关闭状态** —— 这是「三道闸」里的第二道：推上公开仓库就按"
+                "**已泄露**处理（永久存档、搜索索引、别人的 fork 都去不掉），"
+                "事后撤回治不了本。去仓库的 Security 设置里打开。其余：%s"
+                % ("、".join(off), body))
+    elif unknown:
+        res.add("10b", CHECK_TITLES["10b"], SKIP,
+                "%s 的状态**读不到** ⇒ 无法判断，**这不是通过**（读到的原始值：%s）。"
+                "其余：%s" % ("、".join(unknown), states, body))
+    else:
+        res.add("10b", CHECK_TITLES["10b"], PASS,
+                "密钥扫描 / 推送保护均已开启；以下几项**只报不判**（各有取舍）：" + body)
+
+
 # ------------------------------------------------------------------ 主流程
+
+
+def summarize(res):
+    """汇总行与结论、退出码。**抽成函数是为了能单独测** —— 这套计数规则是本工具的
+    信誉所在：跳过与「进行中」都必须被看见，而「全部通过」这句话只在真的全通过时说。
+
+    返回 `(汇总行, 结论行列表, 退出码)`。**「进行中」退出码是 0**：它不是失败；
+    但结论行绝不会因此说出「全部通过」。
+    """
+    line = "%d 通过 / %d 失败 / %d 跳过" % (len(res.passes), len(res.fails), len(res.skips))
+    if res.pending:
+        line += " / %d 进行中" % len(res.pending)
+    if res.fails:
+        return line, ["回验未通过"], 1
+    if res.pending:
+        return line, ["回验未发现失败，但有 %d 项仍在进行中（%s）—— 这**不等于**全部通过；"
+                      "等它跑完再跑一次即可"
+                      % (len(res.pending), "、".join(str(i["no"]) for i in res.pending))], 0
+    if res.skips:
+        return line, ["回验未发现失败，但有 %d 项被跳过 —— 这**不等于**全部通过"
+                      % len(res.skips)], 0
+    return line, ["回验全部通过（%d 项）" % len(res.passes)], 0
 
 
 def write_baseline(url, path):
@@ -831,24 +1035,20 @@ def main(argv=None):
             with tempfile.TemporaryDirectory() as tmp:
                 _guard(res, 9, check_release_asset, res, args.owner, args.repo, local,
                        args.tag, token, tmp, args.asset_name)
+            _guard(res, "10b", check_platform_settings, res, args.owner, args.repo, token)
         except Exception as exc:          # 明确报告，不静默通过
             res.add("!", "远端检查中断", FAIL,
                     "%s: %s（中断之后的项保持「未执行」—— 既不是通过，也不是失败）"
                     % (type(exc).__name__, exc))
 
-    for item in sorted(res.items, key=lambda i: str(i["no"])):
+    for item in sorted(res.items, key=lambda i: report_order(i["no"])):
         print("[%s] %s %s%s" % (item["status"], item["no"], item["name"],
                                 ("  —— " + item["detail"]) if item["detail"] else ""))
-    print("\n%d 通过 / %d 失败 / %d 跳过"
-          % (len(res.passes), len(res.fails), len(res.skips)))
-    if res.fails:
-        print("回验未通过")
-        return 1
-    if res.skips:
-        print("回验未发现失败，但有 %d 项被跳过 —— 这**不等于**全部通过" % len(res.skips))
-        return 0
-    print("回验全部通过（%d 项）" % len(res.passes))
-    return 0
+    line, notes, code = summarize(res)
+    print("\n" + line)
+    for note in notes:
+        print(note)
+    return code
 
 
 if __name__ == "__main__":
