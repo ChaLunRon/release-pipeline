@@ -44,8 +44,15 @@
      没有先行词的「第一人称环境指代」会把作者的观测误当成读者自己的处境；
      确实需要举例说明被禁写法的行，可加行内豁免标记跳过（标记数量会被打印）。
 
+发布前隐私扫描（对应「发出去就收不回来」这个真实约束）：
 
-两条设计纪律（改这个文件前先读）
+ 15. **不该公开的内容**（FAIL）：令牌与密钥形态、私钥块的头标记、真实邮箱、
+     中国大陆手机号形态、内网主机名。内网 **IP 段**已由规则 13 覆盖。
+     范围比可移植性规则更宽（**所有文本文件**）：凭据可以藏在任何地方，
+     而发布物是整个目录。它必须发生在**打 tag 之前** —— 公开即已泄露。
+
+
+三条设计纪律（改这个文件前先读）
 --------------------------------
 
 **一、检查字面量的代码，自身不得含有该字面量的完整形态。**
@@ -55,8 +62,13 @@
 只是再也查不出任何东西。
 
 **二、豁免必须是显式的、可数的。**
-`EXEMPT_MARKER` 允许极少数「必须举例说明被禁写法」的行跳过规则 14，
+`EXEMPT_MARKER` 允许极少数「必须举例说明被禁写法」的行跳过规则 14 与 15，
 但自检器会把标记数量打印出来。数量上涨 = 有人在拿它绕过检查。
+
+**三、宁可列白名单，也不要「看起来差不多就行」的模糊判据。**
+规则 13 与 15 都靠白名单（回环地址与文档保留段、官方的匿址邮箱与保留顶级域）
+把「合法的示例」与「真实的泄露」分开。放宽判据只会换来一堆假阳性，
+而**规则太爱误报就会被关掉** —— 那等于从来没有这条规则。
 
 退出码：0 = 通过；1 = 有失败项；2 = 用法错误。
 """
@@ -96,6 +108,50 @@ IPV4_ALLOWED_NETWORKS = ("192.0.2.", "198.51.100.", "203.0.113.")
 
 ENV_REFERENCE_WORDS = ("本" + "机", "我这台" + "机器", "我" + "的电脑", "实测" + "环境")
 EXEMPT_MARKER = "portability-exempt"
+
+# ----------------------------------------------------------- 规则 15：隐私扫描
+
+# 「发布前隐私扫描」。它挡的是「把不该公开的东西打进发布物」——
+# 而这类东西**一旦推上公开仓库就按已泄露处理**（平台自己的口径：公开仓库里的敏感数据
+# 必须当作已经被取走，第一动作是撤销/轮换凭据）。永久存档、代码搜索索引、
+# 别人的 fork 都去不掉。⇒ **它必须发生在打 tag 之前**，事后撤回治不了本。
+#
+# 元规则照旧：凡「要找的形态」一律**字符串拼接构造**，本文件不得含有它的完整形态。
+
+
+def _p(*parts):
+    return "".join(parts)
+
+
+SECRET_PREFIXES = (
+    _p("gh", "p_"), _p("gh", "o_"), _p("gh", "u_"), _p("gh", "s_"),
+    _p("github", "_pat", "_"),
+    _p("s", "k-"),
+    _p("xo", "xb-"), _p("xo", "xp-"),
+    _p("AK", "IA"),
+    _p("AI", "za"),
+)
+SECRET_RE = re.compile("|".join(re.escape(p) + r"[A-Za-z0-9_-]{16,}" for p in SECRET_PREFIXES))
+
+# 私钥文件的头标记。**要求两侧的连字符**是防假阳性 ——
+# 文档里讲解这条规则时难免要写出「BEGIN 一直到 KEY 收尾」这类描述，那不该被判成泄露。
+PRIVATE_KEY_RE = re.compile(r"-{5}BEGIN[^\n]{0,40}"
+                            + re.escape(_p("PRIVATE", " KEY")) + r"-{5}")
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# 白名单：官方的匿址邮箱、凭据 URL 模板里的平台主机名，以及 RFC 2606 / 6761
+# 保留给文档用的域名与顶级域 —— 它们都不可能是真实的个人信息。
+SAFE_EMAIL_DOMAINS = ("users.noreply.github.com", "noreply.github.com", "github.com",
+                      "example.com", "example.org", "example.net")
+SAFE_EMAIL_TLDS = (".invalid", ".test", ".example")
+
+# 中国大陆手机号：11 位、以 1 开头、第二位 3–9。两侧不许再挨着字母数字 ——
+# 否则一串摘要里的数字段会被误判（这正是本仓库反复踩的那类假阳性）。
+PHONE_RE = re.compile(r"(?<![0-9A-Za-z])1[3-9]\d{9}(?![0-9A-Za-z])")
+# 内网主机名。内网 **IP 段**已由规则 13 覆盖（任何白名单外的地址都是 FAIL），
+# 这里补的是「长得不像地址」的那一半。**只扫文档与配置**（不扫源码）：
+# `args.local` 这种属性访问与主机名长得一模一样，扫源码会变成一台假阳性机器。
+PRIVATE_HOST_RE = re.compile(r"(?<![0-9A-Za-z.-])[A-Za-z0-9][A-Za-z0-9-]*\.(?:internal|local)(?![0-9A-Za-z-])")
 
 # 规则作用范围：文档与配置按文本规则扫；源码只在结构规则里扫。
 PORTABILITY_SUFFIXES = (".md", ".txt", ".yml", ".yaml", ".cff", ".json", ".toml")
@@ -618,6 +674,52 @@ def check_env_references(rep, root):
                % (len(exempts), exempts[:8]))
 
 
+def _is_safe_email(addr):
+    lower = addr.lower()
+    if lower.endswith(SAFE_EMAIL_TLDS):
+        return True
+    domain = lower.rsplit("@", 1)[-1]
+    return any(domain == d or domain.endswith("." + d) for d in SAFE_EMAIL_DOMAINS)
+
+
+def check_privacy(rep, root):
+    """规则 15：发布前隐私扫描。
+
+    扫描范围比可移植性规则更宽 —— **所有文本文件**，不限于文档与配置：
+    凭据与个人信息可以藏在任何地方，而发布物是**整个目录**。
+    """
+    hits = []
+    for path in iter_files(root):
+        try:
+            text = read_text(path)
+        except (UnicodeDecodeError, OSError):
+            continue
+        is_doc = path.endswith(PORTABILITY_SUFFIXES)
+        for i, line in enumerate(text.splitlines(), 1):
+            if EXEMPT_MARKER in line:
+                continue
+            what = None
+            if SECRET_RE.search(line):
+                what = "令牌 / 密钥形态"
+            elif PRIVATE_KEY_RE.search(line):
+                what = "私钥块头标记"
+            elif any(not _is_safe_email(m.group(0)) for m in EMAIL_RE.finditer(line)):
+                what = "邮箱地址"
+            elif PHONE_RE.search(line):
+                what = "手机号形态"
+            elif is_doc and PRIVATE_HOST_RE.search(line):
+                what = "内网主机名"
+            if what:
+                hits.append("%s:%d「%s」" % (rel(root, path), i, what))
+    if hits:
+        rep.fail("发布前隐私扫描发现 %d 处不该公开的内容：%s\n"
+                 "        先逐条判断是不是真泄露，再决定改内容还是加 `%s` 标记；\n"
+                 "        已经推到公开仓库的凭据要先轮换 —— 撤回只是下架，不是修复。"
+                 % (len(hits), "、".join(hits[:8]), EXEMPT_MARKER))
+    else:
+        rep.ok("发布前隐私扫描·无令牌形态 / 私钥块 / 真实邮箱 / 手机号 / 内网主机名")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="selfcheck.py",
                                  description="技能包结构与可移植性自检（纯标准库）")
@@ -649,6 +751,7 @@ def main(argv=None):
     check_machine_paths(rep, root)
     check_ip_literals(rep, root)
     check_env_references(rep, root)
+    check_privacy(rep, root)
 
     if not args.quiet:
         for msg in rep.passes:

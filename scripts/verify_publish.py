@@ -27,6 +27,10 @@
 **跳过**，而不是让它们从报告里**消失** —— 「N 通过 / 1 失败 / 0 跳过」而 N 小于总项数，
 是比失败更危险的读数。
 
+**「本次提交」是第 8 / 8b 两项的取数口径。** 第 8 项按 `head_sha` 取本次提交的运行记录，
+第 8b 项只统计平台自家 CI 产生的 check run。少这两层限定，仓库里一旦有机器人开 PR，
+就会得到两个**永久失败**的假阳性 —— 而永远亮着的红叉会训练人忽略红叉。
+
 **令牌只从环境变量取**（`GH_TOKEN`），不提供命令行参数：命令行参数会进入 shell 历史
 与进程列表，而「令牌不进 URL、不进 refspec、不被回显」是这套流程的核心纪律。
 
@@ -54,6 +58,11 @@ PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 # 但通过的是**发布工作流**。那是假阳性：通过得不对。
 CI_WORKFLOW = "validate"
 
+# 注解只统计平台自己那套 CI（Actions）产生的 check run。
+# 同一个提交上还挂着**别的东西**的检查 —— 依赖更新机器人一开 PR 就会挂上一个，
+# 原先不区分来源地统计，会把别人的注解算到本次提交头上，于是报一个假 FAIL。
+ACTIONS_APP_SLUG = "github-actions"
+
 # 回验计划：**先把每一项登记为「未执行」，跑一项改写一项。**
 # 原先的写法是「执行成功才登记」，于是第 4 项抛异常时第 5–9 项既不执行也不登记 ——
 # 报告里它们**不存在**，汇总却打印「N 通过 / 1 失败 / 0 跳过」。
@@ -66,8 +75,8 @@ CHECK_PLAN = (
     (5, "远端 tag 树 == 本地同名 tag 树"),
     (6, "远端每个 tag 树 == 本地归档目录"),
     (7, "全部 tag 本地树 == 远端树"),
-    (8, "CI 最新 run"),
-    ("8b", "本次提交的注解数（附带判定）"),
+    (8, "CI 本次提交的 run"),
+    ("8b", "本次提交的注解数（只算 Actions，附带判定）"),
     (9, "Release 资产与 tag 逐文件一致"),
     ("9b", "latest 落在最高版本（附带判定）"),
     (10, "凭据残留复查"),
@@ -226,8 +235,20 @@ def local_tags(repo):
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
+def strip_peel(name):
+    """去掉 annotated tag 在 `ls-remote` 里的**解引用后缀**。
+
+    带注释的 tag 在 `ls-remote` 输出里**成对出现**：`X` 与 `X` 加一个 `^{}` 尾巴
+    （后者是它解引用到的对象），而本地 `git tag --list` 只列干净名字。
+    不剥这个后缀，集合比较会**每次**都报「有差异」，差异数恰好等于 tag 个数 ——
+    那是本工具的假阳性，不是线上少了东西。
+    """
+    suffix = "^" + "{}"
+    return name[:-len(suffix)] if name.endswith(suffix) else name
+
+
 def check_tag_sets(res, refs, repo):
-    remote_tags = {r[len("refs/tags/"):] for r in refs if r.startswith("refs/tags/")}
+    remote_tags = {strip_peel(r[len("refs/tags/"):]) for r in refs if r.startswith("refs/tags/")}
     local = set(local_tags(repo))
     diff = remote_tags ^ local
     if diff:
@@ -349,37 +370,58 @@ def _is_workflow(run, workflow):
 
 
 def check_ci(res, owner, repo, expected_sha, token, workflow=CI_WORKFLOW):
-    runs = fetch_json("%s/repos/%s/%s/actions/runs?per_page=100" % (DEFAULT_API, owner, repo), token)
-    items = runs.get("workflow_runs", [])
+    """第 8 / 8b 项：**只认本次提交**。
+
+    原先取「仓库最近 100 条里最新的一条」。仓库一旦有自动化机器人开 PR
+    （本项目一上线就发生了），最新的 run 就属于那个 PR，于是这一项**永久失败** ——
+    而一个永远亮着的红叉会训练人忽略它，真出问题时也就看不见了。
+
+    取数上做两层限定：请求时带 `head_sha` 过滤，拿到之后**再按 sha 过滤一遍**
+    （不依赖服务端一定认这个参数），然后才按时间取最后一条。
+    """
+    data = fetch_json("%s/repos/%s/%s/actions/runs?per_page=100&head_sha=%s"
+                      % (DEFAULT_API, owner, repo, expected_sha), token)
+    items = [r for r in data.get("workflow_runs", []) if r.get("head_sha") == expected_sha]
     if not items:
-        res.add(8, "CI 最新 run", SKIP, "读不到任何运行记录（无法判定，不等于通过）")
-        return
-    scoped = [r for r in items if _is_workflow(r, workflow)]
-    if not scoped:
-        res.add(8, "CI 最新 run", SKIP,
-                "最近 %d 次运行里没有 `%s` 工作流的记录。推 tag 之后发布工作流通常比校验"
-                "更晚结束，不按名字过滤就会拿它顶替校验 —— 那是假阳性。"
-                % (len(items), workflow))
-        return
-    scoped.sort(key=lambda r: r.get("created_at", ""))
-    latest = scoped[-1]
-    conclusion = latest.get("conclusion")
-    head = latest.get("head_sha")
-    name = latest.get("name")
-    detail = "%s #%s head=%s conclusion=%s" % (name, latest.get("run_number"), head, conclusion)
-    if conclusion == "success" and head == expected_sha:
-        res.add(8, "CI 最新 run", PASS, detail)
+        res.add(8, "CI 本次提交的 run", SKIP,
+                "本次提交（%s）名下读不到任何运行记录 —— 可能这个仓库没有配置 CI，"
+                "也可能 push 事件被丢弃（新仓库首次推送的竞态见失败特征速查表）。"
+                "**这不是通过。**" % expected_sha[:12])
     else:
-        res.add(8, "CI 最新 run", FAIL, detail + "（期望 head=%s）" % expected_sha)
-    # 顺带报告本次提交的注解数（判断弃用警告是否已消除）
-    checks = fetch_json("%s/repos/%s/%s/commits/%s/check-runs" % (DEFAULT_API, owner, repo, expected_sha), token)
-    counts = [(c.get("name"), (c.get("output") or {}).get("annotations_count")) for c in checks.get("check_runs", [])]
+        scoped = [r for r in items if _is_workflow(r, workflow)]
+        if not scoped:
+            res.add(8, "CI 本次提交的 run", FAIL,
+                    "本次提交有 %d 条运行记录，但没有 `%s` 工作流的 —— 绿的可能不是它。"
+                    % (len(items), workflow))
+        else:
+            scoped.sort(key=lambda r: r.get("created_at", ""))
+            latest = scoped[-1]
+            conclusion = latest.get("conclusion")
+            detail = "%s #%s head=%s conclusion=%s" % (
+                latest.get("name"), latest.get("run_number"),
+                latest.get("head_sha", "")[:12], conclusion)
+            if conclusion == "success":
+                res.add(8, "CI 本次提交的 run", PASS, detail)
+            else:
+                res.add(8, "CI 本次提交的 run", FAIL, detail)
+    # 顺带报告本次提交的注解数（判断弃用警告是否已消除）。
+    # **只算 Actions 的 check run** —— 同一个提交上还挂着别的来源的检查，
+    # 一起算就是把别人的注解算到本次头上（见 ACTIONS_APP_SLUG 的说明）。
+    checks = fetch_json("%s/repos/%s/%s/commits/%s/check-runs"
+                        % (DEFAULT_API, owner, repo, expected_sha), token)
+    cruns = checks.get("check_runs", [])
+    mine = [c for c in cruns if (c.get("app") or {}).get("slug") == ACTIONS_APP_SLUG]
+    others = sorted({(c.get("app") or {}).get("name") or "（来源未知）"
+                     for c in cruns if (c.get("app") or {}).get("slug") != ACTIONS_APP_SLUG})
+    excluded = "；另有非 Actions 的检查未计入：%s" % "、".join(others) if others else ""
+    counts = [(c.get("name"), (c.get("output") or {}).get("annotations_count")) for c in mine]
     if counts:
-        res.add("8b", "本次提交的注解数（附带判定）",
+        res.add("8b", "本次提交的注解数（只算 Actions，附带判定）",
                 PASS if all(n == 0 for _, n in counts) else FAIL,
-                "、".join("%s=%s" % (n, c) for n, c in counts))
+                "、".join("%s=%s" % (n, c) for n, c in counts) + excluded)
     else:
-        res.add("8b", "本次提交的注解数（附带判定）", SKIP, "该提交没有 check-run 记录")
+        res.add("8b", "本次提交的注解数（只算 Actions，附带判定）", SKIP,
+                "该提交没有 Actions 的 check-run 记录" + excluded)
 
 
 def expected_asset_name(local):

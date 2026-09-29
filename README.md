@@ -1,6 +1,6 @@
 # release-pipeline
 
-![version](https://img.shields.io/badge/version-3.1-blue)
+![version](https://img.shields.io/badge/version-4.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![python](https://img.shields.io/badge/python-3.8%2B-blue)
 [![validate](https://github.com/ChaLunRon/release-pipeline/actions/workflows/validate.yml/badge.svg)](https://github.com/ChaLunRon/release-pipeline/actions/workflows/validate.yml)
@@ -45,7 +45,7 @@ python scripts/selfcheck.py . --quiet
 
 # 3) 推送之后：九项回验
 python scripts/verify_publish.py --owner <owner> --repo <repo> \
-    --local . --tag 3.1 --baseline tags.json
+    --local . --tag 4.0 --baseline tags.json
 ```
 
 两个脚本都是**纯标准库**，无需安装任何第三方依赖。
@@ -68,6 +68,9 @@ python scripts/verify_publish.py --owner <owner> --repo <repo> \
 | 「读起来专业但经不起推敲」的贡献越来越多 | 提交成本趋零、评审成本不变 ⇒ 先写贡献政策（披露 + 人类负责），再卡「**所有**外部贡献者需批准」 |
 | 发布凭据是长期令牌，怕泄露 | 换成 OIDC 信任发布：仓库里不再留任何长期发布令牌（主流注册表 2025 年底已全部支持） |
 | 自己的机器人好像在制造低质 issue | 自动回复把噪声**放大**了 ⇒ 先停掉，复核它生成的内容质量，再决定要不要重开 |
+| 发布物里不小心带出了不该公开的东西 | **撤回治不了本** ⇒ 门槛要挡在发布之前：本地隐私扫描 + 平台的推送保护 |
+| 版本发出去才发现是坏的 | 撤回 = **下架 + 公告**，不是把东西收回来；凭据类要**先轮换**再撤回 |
+| 依赖更新机器人推的正好是我们**不要**的版本 | 它按「越新越好」跑，而这里刻意停在旧一档 ⇒ 在配置里显式忽略大版本 |
 
 ## 三条可移植性规则（本仓库的自我约束）
 
@@ -81,6 +84,18 @@ python scripts/verify_publish.py --owner <owner> --repo <repo> \
 | 第一人称环境指代 | WARN | 文档里出现没有先行词的指代写法；确实要举例说明被禁写法的行可加豁免标记，**标记数量会被打印** |
 
 改写方法与对照表见 [`references/portable-writing.md`](references/portable-writing.md)。
+
+## 还有一条同样的机器判据：发布前隐私扫描
+
+针对的是「**发出去就收不回来**」这个约束 —— 推到公开仓库就按已泄露处理
+（永久存档、代码搜索索引、别人的 fork 都去不掉），所以它必须发生在**打 tag 之前**：
+
+| 规则 | 级别 | 判据 |
+|---|---|---|
+| 发布前隐私扫描 | FAIL | 令牌 / 密钥形态、私钥块头标记、真实邮箱、手机号形态、内网主机名；白名单外的绝对路径与 IP 由上面两条覆盖 |
+
+它带**白名单**（官方的匿址邮箱、文档保留域、保留地址段），因为**规则太爱误报就会被关掉**。
+门槛判据、三类信息的处置与撤回流程见 [`references/withdrawal.md`](references/withdrawal.md)。
 
 ## 仓库结构
 
@@ -96,9 +111,10 @@ release-pipeline/
 │   ├── verification.md               九项回验的可执行口径（含三项附带判定）
 │   ├── maintenance-burden.md         发布之后的长期负担（一次性 / 持续 × 机器 / 人类）
 │   ├── channel-boundaries.md         两个分发渠道各自的规则与边界（消歧用）
+│   ├── withdrawal.md                 撤回 / 作废：门槛、三道闸、Release 上的三个动作
 │   └── portable-writing.md           可移植写法（剔除环境专属值）
 ├── scripts/
-│   ├── selfcheck.py                  结构规范 + 可移植性自检
+│   ├── selfcheck.py                  结构规范 + 可移植性 + 发布前隐私扫描
 │   └── verify_publish.py             推送后九项回验（+ 三项附带判定）
 ├── tests/                            离线单元测试（含工作流检查器的用例）
 └── .github/
@@ -113,7 +129,7 @@ release-pipeline/
 ## 自检与测试
 
 ```bash
-python scripts/selfcheck.py .          # 结构规范 + 可移植性
+python scripts/selfcheck.py .          # 结构规范 + 可移植性 + 发布前隐私扫描
 python .github/lint_workflows.py       # 工作流的引用形态与权限
 python -m unittest discover -s tests -v
 ```
@@ -122,7 +138,7 @@ python -m unittest discover -s tests -v
 - `lint_workflows.py` 是**把清单里「机器可查」的项真正跑起来**的那一步：
   它抓「Action 用了可变标签而不是完整 SHA」「工作流顶层权限没收敛」这类问题。
 - 自检器里有一组「检查器自身不得含有被检查字面量」的用例 —— 防的是「一次全局替换
-  把检查规则改坏，而它仍然打印通过」这种静默失效。
+  把检查规则改坏，而它仍然打印通过」这种静默失效。**隐私扫描的规则常量同样如此。**
 - 声称支持的 Python 版本由 CI 矩阵兑现（见 [`.github/workflows/validate.yml`](.github/workflows/validate.yml)）。
 
 > ⚠️ 自检器有一条「工作区不得有 `__pycache__`」的规则，而 `unittest` 会顺手生成缓存。
@@ -146,11 +162,20 @@ zip 的条目时间戳取构建机器所在时区的时间。所以流水线里�
 
 ⚠️ 仓库若开启**不可变发布**，Release 一旦发出，资产与 tag 就被平台锁死，
 **没有「就地改一改」这个选项** —— 想改只能顺延号位。发布前的最后一次自检要格外认真。
+它**只锁资产与 tag**：标题、说明、Latest 标记仍可改，所以**不会**堵死撤回路径。
+
+两条顺序要求（都会在弄反之后才被想起来）：
+
+- **不可变发布要在第一个 Release 之前开** —— 它只保护开启之后创建的 Release，
+  不追溯；弄反了只能删掉重建；
+- 新仓库**首次推送时 tag 事件可能被丢弃**（分支与 tag 在同一次 push 里）⇒
+  Release 一个都不建。用发布工作流**内置的回填入口**补一次，不必改任何配置。
 
 ## 版本
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| `4.0` | 2026-09-29 | 第一次连上真实远端之后的收口：**新增发布前隐私扫描**（第四个 FAIL 级判据，带白名单）与**撤回 / 作废流程**（[`references/withdrawal.md`](references/withdrawal.md) + 主文件新节）；**修掉回验脚本的三个假阳性**（tag 集合没剥解引用后缀 / CI 取「最新 run」而非「本次提交的 run」/ 注解统计不分来源），全部写成回归用例；依赖更新机器人加 `ignore` 大版本；四条线上实测经验入库 |
 | `3.1` | 2026-09-29 | 把 3.0 评审暴露的问题逐条落地：**裁决两处跨技能的数字冲突**（描述字段上限 / 版本号形态），新增 [`references/channel-boundaries.md`](references/channel-boundaries.md) 说明「两个分发渠道各有各的规则，不是同一问题的两种解法」；**修复回验脚本的六个实现缺陷**（异常时后续项会从报告里消失、资产不按文件名匹配、凭据扫描截断后仍报通过等）；工作流的 Action 固定到完整 SHA，并补上真正会跑的一致性检查（`.github/lint_workflows.py`）；维护清单加「**本仓库现状**」列，让未达标可见 |
 | `3.0` | 2026-09-29 | 新增**阶段 11 长期维护**与配套细则：把「枯燥但必须做」的事按「一次性 / 持续成本 × 机器判定 / 人类判断」分类，并给出各类的现成工具；新增 2026 年的「贡献洪水」与「自动化自己造噪声」两个现实问题；铁律增至十二条 |
 | `2.0` | 2026-09-29 | 更名并扩为端到端：并入快照号位取证与仓库重建（原另一技能的内核）、新增首次发布一篇、新增「不可变发布」与两条执行路径、补入 stat cache 与复制语义两个陷阱 |

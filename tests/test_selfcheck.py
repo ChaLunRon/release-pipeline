@@ -359,6 +359,75 @@ class TestPortabilityRules(Base):
         self.assertIn("IP 字面量", out)
 
 
+class TestPrivacyRule(Base):
+    """规则 15：发布前隐私扫描。
+
+    **夹具里的违规样例一律拼接构造**（令牌前缀、私钥头标记、内网主机名都拼起来），
+    理由与上面三条规则相同：写成完整字面量，本仓库自己的扫描就会命中自己。
+    """
+
+    def test_token_shaped_string_is_failure(self):
+        fake = "ghp" + "_" + "A" * 36
+        root = make_package(self.tmp, extras={"docs/leak.md": "配置里写着 %s\n" % fake})
+        code, out = run(root)
+        self.assertEqual(code, 1)
+        self.assertIn("发布前隐私扫描", out)
+
+    def test_private_key_header_is_failure(self):
+        marker = "-" * 5 + "BEGIN " + "PRIVATE" + " KEY" + "-" * 5
+        root = make_package(self.tmp, extras={"docs/key.md": "%s\n" % marker})
+        code, out = run(root)
+        self.assertEqual(code, 1)
+        self.assertIn("私钥块头标记", out)
+
+    def test_real_email_is_failure(self):
+        addr = "someone" + "@" + "corp-mail.example" + ".cn"
+        root = make_package(self.tmp, extras={"docs/who.md": "联系 %s\n" % addr})
+        code, out = run(root)
+        self.assertEqual(code, 1)
+        self.assertIn("邮箱地址", out)
+
+    def test_noreply_and_reserved_domains_are_allowed(self):
+        """匿址邮箱与文档保留域不是个人信息 —— 白名单窄了会天天误报，
+        宽了才敢在一份永远亮着的清单里留着它。"""
+        root = make_package(self.tmp, extras={
+            "docs/ok.md": "署名 noreply@" + "users.noreply.github.com；"
+                          "示例 hello@example.com；占位 a@test.invalid\n"})
+        code, out = run(root)
+        self.assertEqual(code, 0, out)
+
+    def test_phone_number_is_failure(self):
+        number = "1" + "3800138000"
+        root = make_package(self.tmp, extras={"docs/tel.md": "电话 %s\n" % number})
+        code, out = run(root)
+        self.assertEqual(code, 1)
+        self.assertIn("手机号形态", out)
+
+    def test_long_digit_run_is_not_a_phone(self):
+        """防假阳性回归：摘要 / 计数里的数字段不该被当成手机号。"""
+        root = make_package(self.tmp, extras={
+            "docs/num.md": "摘要 20260929132755，总计 136623 字节。\n"})
+        code, out = run(root)
+        self.assertEqual(code, 0, out)
+
+    def test_private_hostname_in_doc_is_failure(self):
+        host = "build" + "." + "internal"
+        root = make_package(self.tmp, extras={"docs/net.md": "走 %s 代理。\n" % host})
+        code, out = run(root)
+        self.assertEqual(code, 1)
+        self.assertIn("内网主机名", out)
+
+    def test_dotted_attribute_in_source_is_not_a_hostname(self):
+        """防假阳性回归：`args.local` 与主机名长得一模一样。
+
+        源码不参与内网主机名这一条 —— 判据太爱误报就会被关掉。
+        """
+        root = make_package(self.tmp, extras={
+            "scripts/x.py": "def f(args):\n    return args.local\n"})
+        code, out = run(root)
+        self.assertEqual(code, 0, out)
+
+
 class TestCheckerSelfConsistency(unittest.TestCase):
     """检查器自身不得含有被检查字面量的完整形态 —— 否则全局替换会让它静默失效。"""
 
@@ -389,6 +458,17 @@ class TestCheckerSelfConsistency(unittest.TestCase):
         """规则常量必须是拼接形态 —— 直接断言拼接片段存在，防止有人「顺手简化」回去。"""
         self.assertIn('"Users" + "|" + "home"', self.src)
         self.assertIn('"本" + "机"', self.src)
+
+    def test_source_does_not_match_its_own_privacy_rules(self):
+        self.assertIsNone(selfcheck.SECRET_RE.search(self.src),
+                          "自检器源码被自己的「令牌 / 密钥形态」规则命中")
+        self.assertIsNone(selfcheck.PRIVATE_KEY_RE.search(self.src),
+                          "自检器源码被自己的「私钥块头标记」规则命中")
+
+    def test_privacy_constants_are_built_by_concatenation(self):
+        """隐私规则的常量同样得拼接构造 —— 否则将来一次全局替换会把它改坏。"""
+        self.assertIn('_p("gh", "p_")', self.src)
+        self.assertIn('_p("PRIVATE", " KEY")', self.src)
 
     def test_shipped_repo_exemption_count_is_minimal(self):
         """豁免标记是「有意保留的举例行」。数量上涨 = 有人在拿它绕过可移植性检查。"""

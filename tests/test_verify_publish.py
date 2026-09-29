@@ -212,8 +212,35 @@ class TestApiTree(Base):
         self.assertEqual(vp.api_tree("o", "r", "sha"), {"a.txt": "1"})
 
 
+class TestTagSetsPeel(Base):
+    """回归：annotated tag 在 `ls-remote` 里**成对出现**（`X` 与 `X` 加一个解引用尾巴），
+    本地 `git tag --list` 只列干净名字。
+
+    不剥那个后缀，第 2 项会**每次**都报「有差异」，而且差异数恰好等于 tag 个数 ——
+    看起来像线上少了 tag，其实只是取数口径没对齐。
+    """
+
+    def test_peel_suffix_is_stripped(self):
+        repo = make_repo(self.tmp, tag="1.0")
+        refs = {"refs/tags/1.0": "x", "refs/tags/1.0" + "^" + "{}": "y",
+                "refs/heads/main": "z"}
+        res = vp.Result()
+        vp.check_tag_sets(res, refs, repo)
+        self.assertEqual(len(res.fails), 0, res.items)
+        self.assertEqual(len(res.passes), 1)
+
+    def test_peel_suffix_does_not_hide_a_real_extra_tag(self):
+        repo = make_repo(self.tmp, tag="1.0")
+        refs = {"refs/tags/1.0": "x", "refs/tags/1.0" + "^" + "{}": "y",
+                "refs/tags/9.9": "z", "refs/tags/9.9" + "^" + "{}": "w"}
+        res = vp.Result()
+        vp.check_tag_sets(res, refs, repo)
+        self.assertEqual(len(res.fails), 1)
+        self.assertIn("9.9", res.fails[0]["detail"])
+
+
 class TestCheckCi(Base):
-    def _fake(self, conclusion, head, annotations=0):
+    def _fake(self, conclusion, head, annotations=0, extra_checkruns=()):
         def fake(url, token=None):
             if "/actions/runs" in url:
                 return {"workflow_runs": [
@@ -222,8 +249,10 @@ class TestCheckCi(Base):
                     {"name": "validate", "run_number": 2, "conclusion": conclusion,
                      "head_sha": head, "created_at": "2026-01-02T00:00:00Z"},
                 ]}
-            return {"check_runs": [{"name": "validate",
-                                    "output": {"annotations_count": annotations}}]}
+            runs = [{"name": "validate", "app": {"slug": vp.ACTIONS_APP_SLUG},
+                     "output": {"annotations_count": annotations}}]
+            runs.extend(extra_checkruns)
+            return {"check_runs": runs}
         return fake
 
     def test_latest_run_pass(self):
@@ -241,11 +270,61 @@ class TestCheckCi(Base):
         detail = [i for i in res.items if i["no"] == 8][0]["detail"]
         self.assertIn("#2", detail)
 
-    def test_head_sha_mismatch_fails(self):
-        vp.fetch_json = self._fake("success", "other")
+    def test_run_of_another_commit_is_ignored(self):
+        """回归：原先取「仓库最近 100 条里最新的一条」。
+
+        仓库一旦有机器人开 PR（本项目一上线就发生了），最新的 run 就属于那个 PR，
+        这一项于是**永久失败** —— 而永远亮着的红叉会训练人忽略红叉。
+        这里把「属于本次提交的旧 run」与「不属于本次提交的新 run」都放进列表，
+        正确答案是认前者。
+        """
+        def fake(url, token=None):
+            if "/actions/runs" in url:
+                return {"workflow_runs": [
+                    {"name": "validate", "run_number": 7, "conclusion": "success",
+                     "head_sha": "abc", "created_at": "2026-01-01T00:00:00Z"},
+                    {"name": "validate", "run_number": 8, "conclusion": "failure",
+                     "head_sha": "someone-elses-sha",
+                     "created_at": "2026-01-09T00:00:00Z"},
+                ]}
+            return {"check_runs": [{"name": "validate", "app": {"slug": vp.ACTIONS_APP_SLUG},
+                                    "output": {"annotations_count": 0}}]}
+        vp.fetch_json = fake
+        res = vp.Result()
+        vp.check_ci(res, "o", "r", "abc", None)
+        self.assertEqual(len(res.fails), 0, res.items)
+        self.assertIn("#7", [i for i in res.items if i["no"] == 8][0]["detail"])
+
+    def test_no_run_for_this_commit_is_not_a_pass(self):
+        """本次提交名下没有任何运行记录 ⇒ 跳过（且**绝不能**写成通过）。"""
+        def fake(url, token=None):
+            if "/actions/runs" in url:
+                return {"workflow_runs": [
+                    {"name": "validate", "run_number": 8, "conclusion": "success",
+                     "head_sha": "someone-elses-sha",
+                     "created_at": "2026-01-09T00:00:00Z"},
+                ]}
+            return {"check_runs": []}
+        vp.fetch_json = fake
+        res = vp.Result()
+        vp.check_ci(res, "o", "r", "abc", None)
+        self.assertEqual(len(res.fails), 0)
+        self.assertEqual([i["no"] for i in res.skips], [8, "8b"])
+
+    def test_runs_without_the_validate_workflow_fail(self):
+        """本次提交有运行记录，但没有校验工作流 ⇒ FAIL（绿的可能不是它）。"""
+        def fake(url, token=None):
+            if "/actions/runs" in url:
+                return {"workflow_runs": [
+                    {"name": "release", "run_number": 1, "conclusion": "success",
+                     "head_sha": "abc", "created_at": "2026-01-02T00:00:00Z"},
+                ]}
+            return {"check_runs": []}
+        vp.fetch_json = fake
         res = vp.Result()
         vp.check_ci(res, "o", "r", "abc", None)
         self.assertEqual(len(res.fails), 1)
+        self.assertIn("validate", res.fails[0]["detail"])
 
     def test_non_success_conclusion_fails(self):
         vp.fetch_json = self._fake("failure", "abc")
@@ -260,6 +339,18 @@ class TestCheckCi(Base):
         bad = [i for i in res.fails if i["no"] == "8b"]
         self.assertEqual(len(bad), 1)
         self.assertIn("validate=1", bad[0]["detail"])
+
+    def test_checkrun_from_another_app_is_excluded(self):
+        """回归：原先不区分来源地统计注解，把依赖更新机器人的检查算到了本次头上。"""
+        extra = [{"name": "Dependabot", "app": {"slug": "dependabot", "name": "Dependabot"},
+                  "output": {"annotations_count": 3}}]
+        vp.fetch_json = self._fake("success", "abc", annotations=0, extra_checkruns=extra)
+        res = vp.Result()
+        vp.check_ci(res, "o", "r", "abc", None)
+        self.assertEqual(len(res.fails), 0, res.items)
+        detail = [i for i in res.items if i["no"] == "8b"][0]["detail"]
+        self.assertIn("validate=0", detail)
+        self.assertIn("未计入", detail)
 
 
 class TestCheckReleaseAsset(Base):
@@ -507,6 +598,10 @@ class TestCheckerSelfConsistency(unittest.TestCase):
 
     def test_token_prefixes_are_built_by_concatenation(self):
         self.assertIn('"ghp" + "_"', self._source())
+
+    def test_peel_suffix_is_built_by_concatenation(self):
+        """解引用后缀同样拼接构造 —— 同一元规则，别「顺手简化」回去。"""
+        self.assertIn('"^" + "{}"', self._source())
 
 
 if __name__ == "__main__":
