@@ -88,7 +88,7 @@ jobs:
       # 的检出；setup-python 的 v7 移除了 `pip-install` 输入。本工作流只用 `path` 与
       # `python-version` 这类最基础的输入，大版本跳跃只会带入与本次无关的行为变化。
       # 下次这两个大版本被弃用时按同样规则再升一档（并由机器人跟着升 SHA）。
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
