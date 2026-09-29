@@ -54,7 +54,7 @@ jobs:
       # `git fetch origin main`，依赖的正是检出动作持久化的凭据 —— 在无法本地复现 CI 的
       # 前提下，不值得为「更新」冒这个行为变化。这与「固定到 SHA」不矛盾：
       # 一个决定**选哪个版本**，一个决定**用什么形态引用**。
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # 回填要能枚举全部 tag；同时要能读到主分支上的 CHANGELOG
           fetch-depth: 0

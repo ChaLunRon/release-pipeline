@@ -51,7 +51,7 @@ jobs:
       # 那条说的是**选哪个版本**（升一档、不跳档）；这条说的是**用什么形态引用**
       # （不可变 SHA 而不是可变标签）。同时满足的做法就是钉在这一档大版本对应的 SHA 上，
       # 升级交给依赖更新机器人（见 .github/dependabot.yml，生态设为 github-actions）。
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # 先落到中性目录，下面读出 frontmatter 的 `name` 后再改名。
           path: _checkout
